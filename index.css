@@ -1,0 +1,32 @@
+/* stylelint-disable-next-line at-rule-no-unknown */
+@tailwind base;
+/* stylelint-disable-next-line at-rule-no-unknown */
+@tailwind components;
+/* stylelint-disable-next-line at-rule-no-unknown */
+@tailwind utilities;
+
+/* Custom styles for Fiscalia */
+
+/* Line clamp utility for text truncation */
+.line-clamp-2 {
+  display: -webkit-box;
+  line-clamp: 2;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Ensure proper text wrapping and overflow handling */
+.break-words {
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+/* Responsive container improvements */
+@media (min-width: 1280px) {
+  /* Better spacing for xl screens */
+  .container-responsive {
+    max-width: 100%;
+  }
+}
+

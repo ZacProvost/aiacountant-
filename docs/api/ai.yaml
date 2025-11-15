@@ -1,0 +1,176 @@
+openapi: 3.0.3
+info:
+  title: Fiscalia AI Edge Functions
+  version: 1.0.0
+  description: REST interface for the Fiscalia AI orchestration layer.
+servers:
+  - url: https://{project-ref}.functions.supabase.co
+    variables:
+      project-ref:
+        description: Supabase project reference
+        default: your-project-ref
+paths:
+  /ai-proxy:
+    post:
+      summary: Generate an AI response and proposed actions
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AiProxyRequest'
+      responses:
+        '200':
+          description: Successful AI response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AiProxyResponse'
+        '400':
+          description: Invalid payload
+        '401':
+          description: Unauthorized
+        '502':
+          description: Upstream model failure
+  /ai-actions:
+    post:
+      summary: Execute AI-generated actions atomically
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AiActionsRequest'
+      responses:
+        '200':
+          description: Action execution log
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AiActionsResponse'
+        '400':
+          description: Validation error
+        '401':
+          description: Unauthorized
+        '500':
+          description: Transaction failure
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    HistoryMessage:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [user, assistant]
+        content:
+          type: string
+      required: [role, content]
+    AiProxyContext:
+      type: object
+      properties:
+        conversationId:
+          type: string
+        conversationMemory:
+          type: string
+    AiProxyRequest:
+      type: object
+      properties:
+        prompt:
+          type: string
+        history:
+          type: array
+          items:
+            $ref: '#/components/schemas/HistoryMessage'
+        context:
+          $ref: '#/components/schemas/AiProxyContext'
+      required: [prompt]
+    SanitizedAction:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+            - create_job
+            - update_job
+            - update_job_status
+            - delete_job
+            - create_expense
+            - update_expense
+            - delete_expense
+            - attach_expense
+            - detach_expense
+            - create_category
+            - rename_category
+            - delete_category
+            - create_notification
+            - mark_notification_read
+            - delete_notification
+            - query
+            - create_contract
+        data:
+          type: object
+          additionalProperties: {}
+        confirmationMessage:
+          type: string
+      required: [action]
+    AiProxyResponse:
+      type: object
+      properties:
+        text:
+          type: string
+        actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/SanitizedAction'
+        correlationId:
+          type: string
+      required: [text, correlationId]
+    AiActionsRequest:
+      type: object
+      properties:
+        actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/SanitizedAction'
+      required: [actions]
+    ActionExecutionLogEntry:
+      type: object
+      properties:
+        action:
+          type: string
+        status:
+          type: string
+          enum: [success, failed]
+        detail:
+          type: string
+        payload:
+          type: object
+          additionalProperties: {}
+        elapsedMs:
+          type: number
+      required: [action, status, elapsedMs]
+    AiActionsResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        mutated:
+          type: boolean
+        log:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActionExecutionLogEntry'
+        error:
+          type: string
+      required: [success, mutated, log]
+
+

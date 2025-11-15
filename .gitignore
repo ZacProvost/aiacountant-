@@ -1,0 +1,69 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependencies
+node_modules
+dist
+dist-ssr
+
+# Environment variables and secrets
+.env
+.env.*
+.env.local
+.env.development
+.env.production
+.env.test
+*.local
+*.key
+*.pem
+*.p12
+*.crt
+*.cert
+*.secret
+secrets.json
+config.local.json
+
+# Supabase secrets and config
+supabase/.env
+supabase/.env.*
+supabase/config.local.json
+.deno
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Build outputs
+build
+out
+*.tsbuildinfo
+
+# Testing
+coverage
+.nyc_output
+*.lcov
+
+# Temporary files
+tmp
+temp
+*.tmp
+*.bak
+*.swp
+*~
