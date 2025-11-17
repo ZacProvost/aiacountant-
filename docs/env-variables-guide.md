@@ -117,6 +117,39 @@ sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ---
 
+### 5. GOOGLE_SPEECH_API_KEY (Optional)
+
+**⚠️ This is optional** - Only needed for professional-grade French speech-to-text. Without it, the app will use the browser's built-in Web Speech API (free but less accurate).
+
+**Free Tier:** Google Cloud Speech-to-Text offers **60 minutes per month free** - perfect for personal use!
+
+**Location:** Google Cloud Console
+
+**Steps:**
+1. Go to https://console.cloud.google.com/
+2. Create a new project or select an existing one
+3. Enable the **Cloud Speech-to-Text API**:
+   - Go to **APIs & Services** → **Library**
+   - Search for "Cloud Speech-to-Text API"
+   - Click **Enable**
+4. Create an API key:
+   - Go to **APIs & Services** → **Credentials**
+   - Click **Create Credentials** → **API Key**
+   - Copy the API key
+   - (Optional) Restrict the API key to only Cloud Speech-to-Text API for security
+5. Copy the API key
+
+**Example:**
+```
+AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+```
+
+**When to use:** Set this for professional-grade French speech recognition. The app will automatically use Google Cloud Speech-to-Text when available, falling back to Web Speech API if not configured.
+
+**Cost:** Free for up to 60 minutes per month, then $0.006 per 15 seconds (very affordable for occasional use).
+
+---
+
 ## How to Set the Variables
 
 Once you have all the values, set them using the Supabase CLI:
@@ -139,6 +172,18 @@ supabase secrets set LM_STUDIO_URL="http://192.168.0.103:1234"
 
 # Set AI model (optional - defaults to google/gemma-3-12b for LM Studio)
 supabase secrets set AI_PROXY_MODEL="google/gemma-3-12b"
+
+# Set Google Speech API key (optional - for professional French speech-to-text)
+supabase secrets set GOOGLE_SPEECH_API_KEY="AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+
+# Deploy the speech-to-text Edge Function (required for cloud speech recognition)
+supabase functions deploy speech-to-text
+
+# Set OCR.space API key (optional - for professional receipt OCR)
+supabase secrets set OCR_SPACE_API_KEY="your-ocr-space-api-key"
+
+# Deploy the receipt-ocr Edge Function (required for receipt scanning)
+supabase functions deploy receipt-ocr
 ```
 
 ## Verify Your Variables Are Set
@@ -183,6 +228,21 @@ These are optional but can be useful:
 - **Default:** `4`
 - **Purpose:** Number of database connections in the pool
 - **Set with:** `supabase secrets set AI_DB_POOL_SIZE="8"`
+
+### GOOGLE_SPEECH_API_KEY
+- **Default:** Not set (uses Web Speech API fallback)
+- **Purpose:** Enable professional-grade French speech-to-text using Google Cloud Speech-to-Text
+- **Set with:** `supabase secrets set GOOGLE_SPEECH_API_KEY="your-api-key"`
+- **Free Tier:** 60 minutes per month free
+- **Note:** After deploying the `speech-to-text` Edge Function, set this key to enable cloud-based speech recognition
+
+### OCR_SPACE_API_KEY
+- **Default:** Not set (uses Tesseract.js fallback)
+- **Purpose:** Enable professional-grade receipt OCR using OCR.space API
+- **Set with:** `supabase secrets set OCR_SPACE_API_KEY="your-api-key"`
+- **Free Tier:** 25,000 requests per month (no credit card required)
+- **Get Key:** Visit https://ocr.space/ocrapi to sign up for free
+- **Note:** If not set, the app will use Tesseract.js for client-side OCR (still free but slightly less accurate)
 
 ---
 

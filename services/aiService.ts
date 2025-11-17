@@ -4,6 +4,7 @@ import { supabase } from './supabaseClient';
 const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 1500;
 const MAX_HISTORY_MESSAGES = 60; // ENHANCED: Increased to 60 for excellent short-term memory and context tracking
+// This matches the history limit in ai-proxy to ensure consistent context across the system
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 

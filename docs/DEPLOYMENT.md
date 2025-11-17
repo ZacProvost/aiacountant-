@@ -45,6 +45,9 @@ This guide covers deploying Fiscalia to production.
    # OR for OpenRouter (cloud)
    supabase secrets set OPENROUTER_API_KEY="sk-or-v1-your-key"
    supabase secrets set USE_LM_STUDIO="false"
+   
+   # Optional: For professional French speech-to-text (60 min/month free)
+   supabase secrets set GOOGLE_SPEECH_API_KEY="AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
    ```
 
 3. **Verify secrets**
@@ -60,6 +63,7 @@ supabase functions deploy ai-proxy
 supabase functions deploy ai-actions
 supabase functions deploy financial-sync
 supabase functions deploy conversation-memory
+supabase functions deploy speech-to-text  # Optional: for professional speech recognition
 
 # Verify deployment
 supabase functions list
@@ -168,6 +172,7 @@ Then redeploy the `ai-proxy` function.
 - [ ] CORS configured (if needed)
 - [ ] Authentication working
 - [ ] AI chat functioning
+- [ ] Speech-to-text working (optional, requires GOOGLE_SPEECH_API_KEY)
 - [ ] Data persistence verified
 - [ ] Error monitoring set up
 

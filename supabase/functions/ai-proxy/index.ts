@@ -20,12 +20,35 @@ interface HistoryMessage {
   content: string
 }
 
+interface ReceiptData {
+  vendor?: string
+  date?: string
+  total?: number
+  subtotal?: number
+  tax?: {
+    gst?: number
+    pst?: number
+    qst?: number
+    hst?: number
+    total?: number
+  }
+  items?: Array<{
+    name: string
+    price: number
+    quantity?: number
+    unitPrice?: number
+  }>
+  currency?: string
+  receiptPath?: string
+}
+
 interface ProxyRequest {
   prompt: string
   history?: HistoryMessage[]
   context?: {
     conversationId?: string
     conversationMemory?: string | null
+    receipts?: ReceiptData[] // Structured receipt data from recent messages
   }
 }
 
@@ -254,12 +277,110 @@ const summariseJobs = (jobs: JobRecord[], aliases: AliasEntry[]) => {
   }
 }
 
+/**
+ * Extract state changes (deletions/creations) from conversation history
+ * This helps the AI understand what was recently deleted vs what currently exists
+ */
+const extractStateChangesFromHistory = (
+  history: Array<{ role: string; content: string }>,
+  currentJobs: JobRecord[],
+  currentExpenses: ExpenseRecord[]
+): {
+  recentDeletions: Array<{ type: 'job' | 'expense'; name: string; timestamp?: string }>;
+  recentCreations: Array<{ type: 'job' | 'expense'; name: string; timestamp?: string }>;
+} => {
+  const recentDeletions: Array<{ type: 'job' | 'expense'; name: string; timestamp?: string }> = [];
+  const recentCreations: Array<{ type: 'job' | 'expense'; name: string; timestamp?: string }> = [];
+  
+  // Look at last 20 messages for state changes
+  const recentMessages = history.slice(-20);
+  
+  for (const message of recentMessages) {
+    const content = message.content.toLowerCase();
+    const originalContent = message.content; // Keep original for better matching
+    
+    // Detect deletions - multiple patterns to catch various phrasings
+    const deletionPatterns = [
+      /(?:contrat|job)\s+["']?([^"']+?)["']?\s+(?:a\s+été\s+)?(?:supprimé|supprimée|effacé|effacée|retiré|retirée)/i,
+      /(?:dépense|expense)\s+["']?([^"']+?)["']?\s+(?:a\s+été\s+)?(?:supprimé|supprimée|effacé|effacée|retiré|retirée)/i,
+      /(?:supprimé|supprimée|effacé|effacée|retiré|retirée)\s+(?:le|la|l'|un|une)\s+(?:contrat|job|dépense|expense)\s+["']?([^"']+?)["']?/i,
+      /(?:supprimé|supprimée|effacé|effacée|retiré|retirée)[\s:]+["']?([^"']+?)["']?/i,
+    ];
+    
+    for (const pattern of deletionPatterns) {
+      const match = originalContent.match(pattern);
+      if (match && match[1]) {
+        const deletedName = match[1].trim();
+        if (!deletedName || deletedName.length < 2) continue;
+        
+        // Determine type by checking context
+        const isJob = /contrat|job/i.test(match[0]);
+        const isExpense = /dépense|expense/i.test(match[0]);
+        
+        if (isJob || (!isExpense && deletedName.length > 0)) {
+          // Check if this job still exists - if not, it was deleted
+          const stillExists = currentJobs.some(j => j.name?.toLowerCase() === deletedName.toLowerCase());
+          if (!stillExists && !recentDeletions.some(d => d.name.toLowerCase() === deletedName.toLowerCase() && d.type === 'job')) {
+            recentDeletions.push({ type: 'job', name: deletedName });
+          }
+        }
+        if (isExpense || (!isJob && deletedName.length > 0)) {
+          // Check if this expense still exists - if not, it was deleted
+          const stillExists = currentExpenses.some(e => e.name?.toLowerCase() === deletedName.toLowerCase());
+          if (!stillExists && !recentDeletions.some(d => d.name.toLowerCase() === deletedName.toLowerCase() && d.type === 'expense')) {
+            recentDeletions.push({ type: 'expense', name: deletedName });
+          }
+        }
+      }
+    }
+    
+    // Detect creations - multiple patterns
+    const creationPatterns = [
+      /(?:contrat|job)\s+["']?([^"']+?)["']?\s+(?:a\s+été\s+)?(?:créé|créée|ajouté|ajoutée)/i,
+      /(?:dépense|expense)\s+["']?([^"']+?)["']?\s+(?:a\s+été\s+)?(?:créé|créée|ajouté|ajoutée)/i,
+      /(?:créé|créée|ajouté|ajoutée)\s+(?:le|la|l'|un|une)\s+(?:contrat|job|dépense|expense)\s+["']?([^"']+?)["']?/i,
+      /(?:créé|créée|ajouté|ajoutée|nouveau|nouvelle)[\s:]+["']?([^"']+?)["']?/i,
+    ];
+    
+    for (const pattern of creationPatterns) {
+      const match = originalContent.match(pattern);
+      if (match && match[1]) {
+        const createdName = match[1].trim();
+        if (!createdName || createdName.length < 2) continue;
+        
+        // Determine type by checking context
+        const isJob = /contrat|job/i.test(match[0]);
+        const isExpense = /dépense|expense/i.test(match[0]);
+        
+        if (isJob || (!isExpense && createdName.length > 0)) {
+          // Check if this job exists now - if yes, it was created
+          const exists = currentJobs.some(j => j.name?.toLowerCase() === createdName.toLowerCase());
+          if (exists && !recentCreations.some(c => c.name.toLowerCase() === createdName.toLowerCase() && c.type === 'job')) {
+            recentCreations.push({ type: 'job', name: createdName });
+          }
+        }
+        if (isExpense || (!isJob && createdName.length > 0)) {
+          // Check if this expense exists now - if yes, it was created
+          const exists = currentExpenses.some(e => e.name?.toLowerCase() === createdName.toLowerCase());
+          if (exists && !recentCreations.some(c => c.name.toLowerCase() === createdName.toLowerCase() && c.type === 'expense')) {
+            recentCreations.push({ type: 'expense', name: createdName });
+          }
+        }
+      }
+    }
+  }
+  
+  return { recentDeletions, recentCreations };
+};
+
 const buildSystemPrompt = (
   jobSummary: ReturnType<typeof summariseJobs>,
   expenseAliases: ExpenseAliasEntry[],
   categories: string[],
   conversationMemory?: string | null,
-  profile?: { name?: string | null; email?: string | null; company_name?: string | null; tax_rate?: number | null }
+  profile?: { name?: string | null; email?: string | null; company_name?: string | null; tax_rate?: number | null },
+  stateChanges?: { recentDeletions: Array<{ type: 'job' | 'expense'; name: string }>; recentCreations: Array<{ type: 'job' | 'expense'; name: string }> },
+  receipts?: ReceiptData[]
 ) => {
   const temporal = computeTemporalContext()
   const { totals, lines } = jobSummary
@@ -344,6 +465,48 @@ INSTRUCTIONS MÉMOIRE:
 `
     : ""
 
+  // ENHANCED: Receipt data section (structured data for better understanding)
+  const receiptSection = receipts && receipts.length > 0
+    ? `
+
+═══════════════════════════════════════════
+🧾 REÇUS RÉCENTS (DONNÉES STRUCTURÉES)
+═══════════════════════════════════════════
+
+${receipts.map((receipt, idx) => {
+      const parts: string[] = []
+      if (receipt.vendor) parts.push(`Fournisseur: ${receipt.vendor}`)
+      if (receipt.date) parts.push(`Date: ${receipt.date}`)
+      if (receipt.subtotal) parts.push(`Sous-total: ${receipt.subtotal.toFixed(2)}$`)
+      if (receipt.tax) {
+        const taxParts: string[] = []
+        if (receipt.tax.gst) taxParts.push(`TPS: ${receipt.tax.gst.toFixed(2)}$`)
+        if (receipt.tax.pst) taxParts.push(`TVP: ${receipt.tax.pst.toFixed(2)}$`)
+        if (receipt.tax.qst) taxParts.push(`TVQ: ${receipt.tax.qst.toFixed(2)}$`)
+        if (receipt.tax.hst) taxParts.push(`TVH: ${receipt.tax.hst.toFixed(2)}$`)
+        if (receipt.tax.total) taxParts.push(`Taxe totale: ${receipt.tax.total.toFixed(2)}$`)
+        if (taxParts.length > 0) parts.push(`Taxes: ${taxParts.join(', ')}`)
+      }
+      if (receipt.total) parts.push(`TOTAL: ${receipt.total.toFixed(2)}$`)
+      if (receipt.items && receipt.items.length > 0) {
+        // Show all items - no limit (structured data has all items)
+        const itemsList = receipt.items.map(item => 
+          `${item.name}: ${item.price.toFixed(2)}$${item.quantity ? ` (x${item.quantity})` : ''}`
+        ).join('; ')
+        parts.push(`Articles (${receipt.items.length}): [${itemsList}]`)
+      }
+      return `Reçu ${idx + 1}:\n  ${parts.join('\n  ')}`
+    }).join('\n\n')}
+
+INSTRUCTIONS POUR LES REÇUS:
+• Ces données sont EXACTES et COMPLÈTES (extraction OCR améliorée)
+• Utilise-les pour répondre aux questions précises sur les reçus
+• Exemples: "Quelle est la TPS sur le reçu de [fournisseur]?", "Quels articles sont sur ce reçu?", "Combien coûte [article]?"
+• Tu as accès à TOUS les articles et TOUS les détails fiscaux
+• Réponds avec les valeurs EXACTES des reçus
+`
+    : ""
+
   // ENHANCED: Quebec French language rules
   const languageRules = `
 
@@ -378,6 +541,7 @@ EXEMPLES DE MAUVAISES RÉPONSES:
   return `${identitySection}
 ${profileSection}
 ${memorySection}
+${receiptSection}
 ${languageRules}
 
 
@@ -392,24 +556,57 @@ CONTEXTE ACTUEL (${greeting}, ${dayOfWeek} ${temporal.currentDateISO}):
 DONNÉES FINANCIÈRES (alias internes pour actions seulement):
 ${jobSection}
 ${expenseSection}
+${stateChanges && (stateChanges.recentDeletions.length > 0 || stateChanges.recentCreations.length > 0)
+    ? `\n\n⚠️ CHANGEMENTS RÉCENTS D'ÉTAT (CRITIQUE - NE PAS CONFONDRE):\n${
+        stateChanges.recentDeletions.length > 0
+          ? `\nSUPPRIMÉS RÉCEMMENT (n'existent PLUS dans la base de données):\n${stateChanges.recentDeletions
+              .map((d) => `  - ${d.type === 'job' ? 'Contrat' : 'Dépense'} "${d.name}" (supprimé, n'existe plus)`)
+              .join('\n')}`
+          : ''
+      }${
+        stateChanges.recentCreations.length > 0
+          ? `\n\nCRÉÉS RÉCEMMENT (existent MAINTENANT dans la base de données):\n${stateChanges.recentCreations
+              .map((c) => `  - ${c.type === 'job' ? 'Contrat' : 'Dépense'} "${c.name}" (créé récemment, existe maintenant)`)
+              .join('\n')}`
+          : ''
+      }\n\nRÈGLE ABSOLUE: Si un élément a été supprimé puis recréé avec le même nom, ce sont DEUX éléments DIFFÉRENTS. Utilise TOUJOURS les IDs actuels de la base de données, JAMAIS des références à des éléments supprimés.`
+    : ''}
 
 ═══════════════════════════════════════════
 ⚡ RÈGLES DE COMPORTEMENT (CRITIQUES)
 ═══════════════════════════════════════════
 
-1. MÉMOIRE CONTEXTUELLE (NOUVEAU - TRÈS IMPORTANT):
+1. MÉMOIRE CONTEXTUELLE ET GESTION DES SUPPRESSIONS (CRITIQUE):
    ⚠️ La conversation COMPLÈTE est dans l'historique des messages ci-dessous
    ⚠️ Quand l'utilisateur dit "ce contrat", "cette dépense", "celui-là", "le dernier", etc.:
       → REGARDE les derniers messages de la conversation
       → IDENTIFIE de quel contrat/dépense il parle
-      → UTILISE le bon ID ou nom pour l'action
+      → VÉRIFIE que cet élément EXISTE ENCORE dans la base de données (regarde la section DONNÉES FINANCIÈRES)
+      → Si l'élément a été supprimé, dis clairement "Cet élément a été supprimé" et demande confirmation
+      → Si l'élément existe, UTILISE le bon ID ou nom pour l'action
    ⚠️ Si vraiment ambigu, demande "Tu parles du contrat [Nom]?" plutôt que de dire "Je ne trouve pas"
+   
+   ⚠️⚠️ RÈGLE ABSOLUE SUR LES SUPPRESSIONS ET RECRÉATIONS:
+   - Si un élément a été supprimé (voir section CHANGEMENTS RÉCENTS), il N'EXISTE PLUS
+   - Si un élément avec le même nom existe maintenant, c'est un NOUVEL élément (ID différent)
+   - JAMAIS confondre un élément supprimé avec un élément recréé
+   - TOUJOURS utiliser les IDs de la base de données ACTUELLE, pas des IDs d'éléments supprimés
+   - Si l'utilisateur mentionne un nom qui existe dans les suppressions récentes ET dans les créations récentes, 
+     utilise TOUJOURS celui qui existe maintenant (création récente)
    
    EXEMPLES DE RÉSOLUTION CONTEXTUELLE:
    User: "Crée un contrat Plomberie Laval 5000$"
    AI: "Parfait! Contrat créé." [se souvient: dernier contrat = Plomberie Laval]
    User: "Supprime ce contrat"
-   AI: [REGARDE historique → dernier contrat mentionné = Plomberie Laval] → utilise son ID pour delete_job
+   AI: [REGARDE historique → dernier contrat mentionné = Plomberie Laval] → [VÉRIFIE qu'il existe] → utilise son ID pour delete_job
+   
+   EXEMPLE DE GESTION DES SUPPRESSIONS:
+   User: "Supprime le contrat Plomberie Laval"
+   AI: [Supprime] → "Contrat supprimé."
+   User: "Crée un contrat Plomberie Laval 5000$"
+   AI: [CRÉE UN NOUVEAU contrat - c'est différent de celui supprimé] → "Parfait! Nouveau contrat Plomberie Laval créé."
+   User: "Supprime ce contrat"
+   AI: [REGARDE historique → dernier contrat mentionné = Plomberie Laval] → [VÉRIFIE qu'il existe dans DONNÉES FINANCIÈRES] → [Utilise l'ID du NOUVEAU contrat, pas l'ancien supprimé]
 
 2. PRÉCISION ABSOLUE:
    • Calculs toujours exacts
@@ -442,10 +639,62 @@ ACTIONS DISPONIBLES:
 • update_job_status: {jobId?, jobName?, status} (raccourci pour changer statut uniquement)
 • delete_job: {jobId?, jobName?}
   → Si l'utilisateur dit "supprime ce contrat", REGARDE l'historique pour identifier lequel
-• create_expense: {name, amount, category, date?, jobId?, jobName?, vendor?, notes?}
-• update_expense: {expenseId?, expenseName?, updates:{name?, amount?, category?, date?, jobId?, vendor?, notes?}}
+• create_expense: {name, amount, category, date?, jobId?, jobName?, vendor?, notes?, receiptImage?}
+  ⚠️⚠️ RÈGLE ABSOLUE POUR LES REÇUS:
+  Quand un reçu est attaché, tu verras dans le message utilisateur un bloc du type:
+     [reçu: chemin_reçu=USERID/UUID.jpg ; fournisseur=NOM ; sous_total=100.00 ; TPS=5.00 ; TVQ=9.98 ; total=123.45 ; date=AAAA-MM-JJ ; articles=[Article1:10.00; Article2:15.00]]
+  
+  ⚠️⚠️ TU DOIS OBLIGATOIREMENT:
+     1. COPIER la valeur après "chemin_reçu=" dans data.receiptImage (path exact du fichier)
+     2. UTILISER AUTOMATIQUEMENT les données du reçu SANS DEMANDER:
+        - data.amount = la valeur après "total=" (si présent)
+        - data.date = la valeur après "date=" (convertir en format AAAA-MM-JJ si nécessaire, ou utiliser date du jour si format invalide)
+        - data.vendor = la valeur après "fournisseur=" (si présent)
+        - data.name = peut être dérivé du fournisseur ou du contexte si l'utilisateur ne précise pas
+     3. NE JAMAIS demander le montant, la date ou le fournisseur si ces informations sont dans le bloc [reçu: ...]
+     4. Si la date du reçu est en format texte (ex: "15 novembre 2025"), convertis-la en AAAA-MM-JJ (ex: "2025-11-15")
+     5. Si la date n'est pas lisible ou absente, utilise la date du jour (${temporal.currentDateISO})
+  
+  EXEMPLE:
+  User: "Crée la dépense" avec [reçu: chemin_reçu=abc/123.jpg ; fournisseur=DOLLARAMA ; total=2.75 ; date=2025-11-15]
+  AI: {"text":"Parfait! Dépense créée pour DOLLARAMA de 2.75$ le 15 novembre 2025.","actions":[{"action":"create_expense","data":{"name":"DOLLARAMA","amount":2.75,"category":"Autre","date":"2025-11-15","vendor":"DOLLARAMA","receiptImage":"abc/123.jpg"}}]}
+  
+  ⚠️ Si plusieurs reçus sont mentionnés, utilise le DERNIER reçu attaché dans la conversation.
+
+  ⚠️⚠️ RÉPONDRE AUX QUESTIONS SUR LES REÇUS:
+  Quand l'utilisateur pose une question sur un reçu (ex: "Quelle est la TPS?", "Quels articles sont sur ce reçu?", "Combien coûte [article]?"):
+     1. REGARDE le bloc [reçu: ...] dans le message utilisateur ACTUEL ou dans l'HISTORIQUE de la conversation (messages précédents)
+     2. Si un reçu a été attaché dans un message précédent, son contexte [reçu: ...] sera inclus dans l'historique
+     3. UTILISE les données extraites pour répondre:
+        - "sous_total=" = montant avant taxes
+        - "TPS=" = Taxe sur les produits et services (GST)
+        - "TVP=" = Taxe de vente provinciale (PST)
+        - "TVQ=" = Taxe de vente du Québec (QST)
+        - "TVH=" = Taxe de vente harmonisée (HST)
+        - "taxe_totale=" = total des taxes (si pas de détail)
+        - "articles=[...]" = liste des articles avec prix (format: Nom:Montant; Nom:Montant)
+        - "total=" = montant total final
+        - "fournisseur=" = nom du magasin/fournisseur
+        - "date=" = date du reçu
+     3. RÉPONDS de façon NATURELLE et PRÉCISE avec les valeurs exactes
+     4. Si une information n'est pas dans le bloc [reçu: ...], dis que tu ne l'as pas
+  
+  EXEMPLES DE RÉPONSES AUX QUESTIONS:
+  User: "Quelle est la TPS sur ce reçu?" avec [reçu: ... ; TPS=5.00 ; ...]
+  AI: {"text":"La TPS sur ce reçu est de 5.00$.","actions":[]}
+  
+  User: "Quels articles sont sur ce reçu?" avec [reçu: ... ; articles=[Pain:5.00; Lait:10.00; Oeufs:15.00]]
+  AI: {"text":"Sur ce reçu, il y a: Pain à 5.00$, Lait à 10.00$, et Oeufs à 15.00$.","actions":[]}
+  
+  User: "Combien coûte le Pain?" avec [reçu: ... ; articles=[Pain:5.00; ...]]
+  AI: {"text":"Le Pain coûte 5.00$ sur ce reçu.","actions":[]}
+  
+  User: "Quel est le sous-total avant taxes?" avec [reçu: ... ; sous_total=30.00 ; ...]
+  AI: {"text":"Le sous-total avant taxes est de 30.00$.","actions":[]}
+• update_expense: {expenseId?, expenseName?, updates:{name?, amount?, category?, date?, jobId?, vendor?, notes?, receiptImage?}}
   → Mets SEULEMENT les champs modifiés dans "updates"
   → Ne mets JAMAIS null, undefined, ou "" dans "updates"
+  → Si tu dois lier une dépense EXISTANTE à un reçu attaché récemment, mets updates:{receiptImage:"CHEMIN_REÇU"} avec le même path que ci‑dessus
   → Si l'utilisateur dit "cette dépense" ou "celle-là", REGARDE l'historique pour identifier laquelle
 • delete_expense: {expenseId?, expenseName?}
   → Si l'utilisateur dit "supprime cette dépense", REGARDE l'historique pour identifier laquelle
@@ -882,16 +1131,21 @@ serve(async (req) => {
     const jobAliasMap = new Map(jobAliases.map((alias) => [alias.id, alias]))
     const expenseAliases = buildExpenseAliases(expenses, jobAliasMap)
     const sanitizedPrompt = applyAliases(applyAliases(payload.prompt, expenseAliases), jobAliases)
-    // ENHANCED: Keep 50 recent messages for excellent short-term memory
+    // ENHANCED: Keep 60 recent messages for excellent short-term memory
     // This ensures the AI can track recent entities and references like "that contract"
     // The memory summary provides additional long-term context
-    const sanitizedHistory = (payload.history ?? []).slice(-50).map((message) => ({
+    const sanitizedHistory = (payload.history ?? []).slice(-60).map((message) => ({
       role: message.role,
       content: applyAliases(applyAliases(message.content, expenseAliases), jobAliases),
     }))
+    
+    // CRITICAL: Extract recent state changes from conversation history
+    // This helps the AI understand what was deleted and what was created
+    const recentStateChanges = extractStateChangesFromHistory(sanitizedHistory, jobs, expenses)
 
     const jobSummary = summariseJobs(jobs, jobAliases)
-    const systemPrompt = buildSystemPrompt(jobSummary, expenseAliases, categories, conversationMemory, profile)
+    const receipts = payload.context?.receipts || []
+    const systemPrompt = buildSystemPrompt(jobSummary, expenseAliases, categories, conversationMemory, profile, recentStateChanges, receipts)
 
     // Determine which AI provider to use (need this early to format messages correctly)
     const useLmStudio = Deno.env.get("USE_LM_STUDIO") === "true"

@@ -6,6 +6,72 @@ import { aiService } from './services/aiService';
 import { actionService } from './services/actionService';
 import { speechService } from './services/speechService';
 import { createMessageId } from './services/chatUtils';
+import { ReceiptScanner } from './components/ReceiptScanner';
+import { fileToBase64 } from './services/ocrService';
+import { supabase } from './services/supabaseClient';
+import { authService } from './services/authService';
+
+// Parse a YYYY-MM-DD date string as a LOCAL date (not UTC) to avoid timezone issues
+function parseLocalDate(dateStr: string): Date {
+    // If it's already in YYYY-MM-DD format, parse it as local date to avoid UTC conversion
+    if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+        const [year, month, day] = dateStr.split('-').map(Number);
+        return new Date(year, month - 1, day); // Local date, not UTC
+    }
+    // For other formats, use standard Date parsing
+    return new Date(dateStr);
+}
+
+// Format a date string (YYYY-MM-DD) to a localized date string without timezone issues
+function formatLocalDate(dateStr: string, options?: Intl.DateTimeFormatOptions): string {
+    const date = parseLocalDate(dateStr);
+    return date.toLocaleDateString('fr-CA', options || { year: 'numeric', month: 'long', day: 'numeric' });
+}
+
+// Normalize various date strings into YYYY-MM-DD; fallback to today
+function normalizeDateToISO(input?: string): string {
+    if (!input) return new Date().toISOString().split('T')[0];
+    // Try patterns: DD/MM/YYYY, MM/DD/YYYY, YYYY-MM-DD, YYYY/MM/DD, "Nov 16 2025", etc.
+    const trimmed = input.trim();
+    // If already ISO-like
+    const isoMatch = trimmed.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+    if (isoMatch) {
+        const [_, y, m, d] = isoMatch;
+        const dt = new Date(Number(y), Number(m) - 1, Number(d));
+        if (!isNaN(dt.getTime())) return dt.toISOString().split('T')[0];
+    }
+    // DD/MM/YYYY or MM/DD/YYYY – detect by values > 12 as day
+    const slash = trimmed.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
+    if (slash) {
+        let d = Number(slash[1]);
+        let m = Number(slash[2]);
+        let y = Number(slash[3]);
+        if (y < 100) y += 2000;
+        // If first is >12, assume DD/MM
+        if (d > 12) {
+            // d as day, m as month
+        } else if (m > 12) {
+            // swap
+            const t = d; d = m; m = t;
+        }
+        const dt = new Date(y, m - 1, d);
+        if (!isNaN(dt.getTime())) return dt.toISOString().split('T')[0];
+    }
+    // Month name formats
+    const monthNames = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+    const monthRegex = new RegExp(`(${monthNames.join('|')})[a-z]*[\\s,.\\-]+(\\d{1,2})[\\s,.\\-]+(\\d{2,4})`, 'i');
+    const named = trimmed.match(monthRegex);
+    if (named) {
+        const mIdx = monthNames.findIndex(m => named[1].toLowerCase().startsWith(m)) + 1;
+        const d = Number(named[2]);
+        let y = Number(named[3]);
+        if (y < 100) y += 2000;
+        const dt = new Date(y, mIdx - 1, d);
+        if (!isNaN(dt.getTime())) return dt.toISOString().split('T')[0];
+    }
+    // Fallback
+    return new Date().toISOString().split('T')[0];
+}
 
 interface IconProps {
     className?: string;
@@ -75,7 +141,7 @@ export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children, 
             <div className={`bg-white rounded-lg shadow-xl w-full ${sizeClasses[size]}`} onClick={e => e.stopPropagation()}>
                 <div className="flex justify-between items-center p-6 border-b border-fiscalia-primary-dark/10">
                     <h2 className="text-3xl font-display font-medium tracking-tight text-fiscalia-primary-dark">{title}</h2>
-                    <button onClick={onClose} className="text-fiscalia-primary-dark/50 hover:text-fiscalia-primary-dark">
+                    <button type="button" onClick={onClose} className="text-fiscalia-primary-dark/50 hover:text-fiscalia-primary-dark">
                         <XMarkIcon className="w-6 h-6" />
                     </button>
                 </div>
@@ -103,14 +169,20 @@ interface AuthScreenProps {
     onModeChange: (mode: 'signin' | 'signup') => void;
     onSignIn: (payload: { email: string; password: string }) => Promise<void>;
     onSignUp: (payload: { email: string; password: string; name?: string }) => Promise<void>;
+    onForgotPassword?: (email: string) => Promise<void>;
     isLoading: boolean;
     error?: string | null;
 }
 
-export const AuthScreen: React.FC<AuthScreenProps> = ({ mode, onModeChange, onSignIn, onSignUp, isLoading, error }) => {
+export const AuthScreen: React.FC<AuthScreenProps> = ({ mode, onModeChange, onSignIn, onSignUp, onForgotPassword, isLoading, error }) => {
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
     const [name, setName] = useState('');
+    const [showForgotPassword, setShowForgotPassword] = useState(false);
+    const [forgotPasswordEmail, setForgotPasswordEmail] = useState('');
+    const [isRequestingReset, setIsRequestingReset] = useState(false);
+    const [resetSuccess, setResetSuccess] = useState(false);
+    const [resetError, setResetError] = useState<string | null>(null);
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -120,6 +192,101 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ mode, onModeChange, onSi
             await onSignUp({ email, password, name });
         }
     };
+
+    const handleForgotPassword = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!forgotPasswordEmail) {
+            setResetError('Veuillez entrer votre adresse email');
+            return;
+        }
+        setIsRequestingReset(true);
+        setResetError(null);
+        try {
+            if (onForgotPassword) {
+                await onForgotPassword(forgotPasswordEmail);
+                setResetSuccess(true);
+            }
+        } catch (error) {
+            setResetError(error instanceof Error ? error.message : 'Erreur lors de l\'envoi de l\'email de réinitialisation');
+        } finally {
+            setIsRequestingReset(false);
+        }
+    };
+
+    if (showForgotPassword) {
+        return (
+            <div className="min-h-screen flex items-center justify-center bg-fiscalia-primary-dark text-white p-4">
+                <div className="w-full max-w-md bg-white/5 backdrop-blur-lg border border-white/10 rounded-2xl p-8 shadow-2xl space-y-6">
+                    <div className="flex items-center justify-center gap-3">
+                        <Logo className="w-10 h-10 text-fiscalia-accent-gold" />
+                        <h1 className="text-3xl font-display font-semibold tracking-tight">Fiscalia</h1>
+                    </div>
+                    <div className="text-center space-y-1">
+                        <h2 className="text-xl font-medium">Mot de passe oublié</h2>
+                        <p className="text-sm text-white/70">
+                            Entrez votre adresse email et nous vous enverrons un lien pour réinitialiser votre mot de passe.
+                        </p>
+                    </div>
+                    {resetSuccess ? (
+                        <div className="space-y-4 text-center">
+                            <div className="bg-green-500/20 border border-green-500/40 text-green-400 text-sm px-3 py-2 rounded-lg">
+                                Un email de réinitialisation a été envoyé à {forgotPasswordEmail}. Vérifiez votre boîte de réception.
+                            </div>
+                            <button
+                                type="button"
+                                className="text-sm text-white/70 hover:text-white hover:underline"
+                                onClick={() => {
+                                    setShowForgotPassword(false);
+                                    setResetSuccess(false);
+                                    setResetError(null);
+                                    setForgotPasswordEmail('');
+                                }}
+                            >
+                                Retour à la connexion
+                            </button>
+                        </div>
+                    ) : (
+                        <form onSubmit={handleForgotPassword} className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium text-white/70 mb-1">Adresse courriel</label>
+                                <input
+                                    type="email"
+                                    value={forgotPasswordEmail}
+                                    onChange={e => setForgotPasswordEmail(e.target.value)}
+                                    className="w-full bg-white/10 text-white placeholder:text-white/50 p-3 rounded-lg border border-white/10 focus:outline-none focus:ring-2 focus:ring-fiscalia-accent-gold/60"
+                                    placeholder="vous@exemple.com"
+                                    disabled={isRequestingReset}
+                                    required
+                                />
+                            </div>
+                            {resetError && (
+                                <div className="bg-fiscalia-error/20 border border-fiscalia-error/40 text-fiscalia-error text-sm px-3 py-2 rounded-lg">
+                                    {resetError}
+                                </div>
+                            )}
+                            <Button type="submit" className="w-full" disabled={isRequestingReset}>
+                                {isRequestingReset ? 'Envoi en cours...' : 'Envoyer le lien de réinitialisation'}
+                            </Button>
+                            <div className="text-center">
+                                <button
+                                    type="button"
+                                    className="text-sm text-white/70 hover:text-white hover:underline"
+                                    onClick={() => {
+                                        setShowForgotPassword(false);
+                                        setResetError(null);
+                                        setForgotPasswordEmail('');
+                                    }}
+                                    disabled={isRequestingReset}
+                                >
+                                    Retour à la connexion
+                                </button>
+                            </div>
+                        </form>
+                    )}
+                </div>
+            </div>
+        );
+    }
 
     return (
         <div className="min-h-screen flex items-center justify-center bg-fiscalia-primary-dark text-white p-4">
@@ -163,7 +330,19 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ mode, onModeChange, onSi
                         />
                     </div>
                     <div>
-                        <label className="block text-sm font-medium text-white/70 mb-1">Mot de passe</label>
+                        <div className="flex items-center justify-between mb-1">
+                            <label className="block text-sm font-medium text-white/70">Mot de passe</label>
+                            {mode === 'signin' && onForgotPassword && (
+                                <button
+                                    type="button"
+                                    className="text-xs text-fiscalia-accent-gold hover:underline"
+                                    onClick={() => setShowForgotPassword(true)}
+                                    disabled={isLoading}
+                                >
+                                    Mot de passe oublié?
+                                </button>
+                            )}
+                        </div>
                         <input
                             type="password"
                             value={password}
@@ -219,6 +398,178 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ mode, onModeChange, onSi
     );
 };
 
+interface ResetPasswordScreenProps {
+    onPasswordReset?: () => void;
+    onCancel?: () => void;
+}
+
+export const ResetPasswordScreen: React.FC<ResetPasswordScreenProps> = ({ onPasswordReset, onCancel }) => {
+    const [password, setPassword] = useState('');
+    const [confirmPassword, setConfirmPassword] = useState('');
+    const [error, setError] = useState<string | null>(null);
+    const [isLoading, setIsLoading] = useState(false);
+    const [success, setSuccess] = useState(false);
+    const [hasSession, setHasSession] = useState(false);
+
+    // Check for recovery session when component mounts
+    useEffect(() => {
+        const checkSession = async () => {
+            try {
+                const session = await authService.getSession();
+                setHasSession(!!session);
+                if (!session) {
+                    setError('Session de récupération invalide ou expirée. Veuillez demander un nouveau lien de réinitialisation.');
+                }
+            } catch (error) {
+                console.error('Failed to check session', error);
+                setHasSession(false);
+                setError('Impossible de vérifier la session. Veuillez réessayer.');
+            }
+        };
+        checkSession();
+
+        // Also listen for auth state changes
+        const unsubscribe = authService.onAuthStateChange((session) => {
+            setHasSession(!!session);
+            if (session) {
+                setError(null);
+            }
+        });
+
+        return () => {
+            unsubscribe();
+        };
+    }, []);
+
+    const handleSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setError(null);
+
+        if (!password || !confirmPassword) {
+            setError('Veuillez remplir tous les champs');
+            return;
+        }
+
+        if (password !== confirmPassword) {
+            setError('Les mots de passe ne correspondent pas');
+            return;
+        }
+
+        if (password.length < 8) {
+            setError('Le mot de passe doit contenir au moins 8 caractères');
+            return;
+        }
+
+        // Verify we have a session before attempting to update password
+        if (!hasSession) {
+            setError('Session de récupération invalide ou expirée. Veuillez demander un nouveau lien de réinitialisation.');
+            return;
+        }
+
+        setIsLoading(true);
+        try {
+            await authService.updatePassword(password);
+            setSuccess(true);
+            if (onPasswordReset) {
+                setTimeout(() => {
+                    onPasswordReset();
+                }, 2000);
+            }
+        } catch (error) {
+            console.error('Failed to reset password', error);
+            setError(error instanceof Error ? error.message : 'Erreur lors de la réinitialisation du mot de passe. Le lien peut être expiré ou invalide.');
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    if (success) {
+        return (
+            <div className="min-h-screen flex items-center justify-center bg-fiscalia-primary-dark text-white p-4">
+                <div className="w-full max-w-md bg-white/5 backdrop-blur-lg border border-white/10 rounded-2xl p-8 shadow-2xl space-y-6 text-center">
+                    <div className="flex items-center justify-center gap-3">
+                        <Logo className="w-10 h-10 text-fiscalia-accent-gold" />
+                        <h1 className="text-3xl font-display font-semibold tracking-tight">Fiscalia</h1>
+                    </div>
+                    <div className="space-y-4">
+                        <div className="text-6xl">✓</div>
+                        <h2 className="text-2xl font-medium">Mot de passe réinitialisé</h2>
+                        <p className="text-white/70">
+                            Votre mot de passe a été réinitialisé avec succès. Vous allez être redirigé vers la page de connexion.
+                        </p>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="min-h-screen flex items-center justify-center bg-fiscalia-primary-dark text-white p-4">
+            <div className="w-full max-w-md bg-white/5 backdrop-blur-lg border border-white/10 rounded-2xl p-8 shadow-2xl space-y-6">
+                <div className="flex items-center justify-center gap-3">
+                    <Logo className="w-10 h-10 text-fiscalia-accent-gold" />
+                    <h1 className="text-3xl font-display font-semibold tracking-tight">Fiscalia</h1>
+                </div>
+                <div className="text-center space-y-1">
+                    <h2 className="text-xl font-medium">Réinitialiser le mot de passe</h2>
+                    <p className="text-sm text-white/70">
+                        Entrez votre nouveau mot de passe ci-dessous.
+                    </p>
+                </div>
+                <form onSubmit={handleSubmit} className="space-y-4">
+                    <div>
+                        <label className="block text-sm font-medium text-white/70 mb-1">Nouveau mot de passe</label>
+                        <input
+                            type="password"
+                            value={password}
+                            onChange={e => setPassword(e.target.value)}
+                            className="w-full bg-white/10 text-white placeholder:text-white/50 p-3 rounded-lg border border-white/10 focus:outline-none focus:ring-2 focus:ring-fiscalia-accent-gold/60"
+                            placeholder="Minimum 8 caractères"
+                            disabled={isLoading}
+                            required
+                            minLength={8}
+                        />
+                        <p className="text-xs text-white/60 mt-1">Le mot de passe doit contenir au moins 8 caractères</p>
+                    </div>
+                    <div>
+                        <label className="block text-sm font-medium text-white/70 mb-1">Confirmer le mot de passe</label>
+                        <input
+                            type="password"
+                            value={confirmPassword}
+                            onChange={e => setConfirmPassword(e.target.value)}
+                            className="w-full bg-white/10 text-white placeholder:text-white/50 p-3 rounded-lg border border-white/10 focus:outline-none focus:ring-2 focus:ring-fiscalia-accent-gold/60"
+                            placeholder="Confirmez votre mot de passe"
+                            disabled={isLoading}
+                            required
+                            minLength={8}
+                        />
+                    </div>
+                    {error && (
+                        <div className="bg-fiscalia-error/20 border border-fiscalia-error/40 text-fiscalia-error text-sm px-3 py-2 rounded-lg">
+                            {error}
+                        </div>
+                    )}
+                    <Button type="submit" className="w-full" disabled={isLoading || !hasSession}>
+                        {isLoading ? 'Réinitialisation en cours...' : hasSession ? 'Réinitialiser le mot de passe' : 'En attente de la session...'}
+                    </Button>
+                </form>
+                {onCancel && (
+                    <div className="text-center">
+                        <button
+                            type="button"
+                            className="text-sm text-white/70 hover:text-white hover:underline"
+                            onClick={onCancel}
+                            disabled={isLoading}
+                        >
+                            Annuler
+                        </button>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
 interface ConfirmModalProps {
     isOpen: boolean;
     onClose: () => void;
@@ -250,7 +601,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
             <div className="bg-white rounded-lg shadow-xl w-full max-w-md" onClick={e => e.stopPropagation()}>
                 <div className="flex justify-between items-center p-6 border-b border-fiscalia-primary-dark/10">
                     <h2 className="text-2xl font-display font-medium tracking-tight text-fiscalia-primary-dark">{title}</h2>
-                    <button onClick={onClose} className="text-fiscalia-primary-dark/50 hover:text-fiscalia-primary-dark">
+                    <button type="button" onClick={onClose} className="text-fiscalia-primary-dark/50 hover:text-fiscalia-primary-dark">
                         <XMarkIcon className="w-6 h-6" />
                     </button>
                 </div>
@@ -673,13 +1024,126 @@ const AIMessageBubble: React.FC<{ message: ChatMessage }> = ({ message }) => (
   </div>
 );
 
-const UserMessageBubble: React.FC<{ message: ChatMessage }> = ({ message }) => (
+const UserMessageBubble: React.FC<{ message: ChatMessage }> = ({ message }) => {
+  const [receiptUrl, setReceiptUrl] = useState<string | null>(null);
+  const [isLoadingReceipt, setIsLoadingReceipt] = useState(false);
+
+  // Generate signed URL from receiptPath when component mounts or receiptPath changes
+  useEffect(() => {
+    // Priority 1: If message already has a receiptImage (blob URL, data URL, or HTTP URL), use it immediately
+    if (message.receiptImage && (message.receiptImage.startsWith('data:') || message.receiptImage.startsWith('http') || message.receiptImage.startsWith('blob:'))) {
+      setReceiptUrl(message.receiptImage);
+      setIsLoadingReceipt(false);
+      return;
+    }
+
+    // Priority 2: If we have a receiptPath but no receiptImage, generate a signed URL
+    // This happens when loading messages from database (after refresh/return)
+    if (message.receiptPath && !message.receiptImage) {
+      setIsLoadingReceipt(true);
+      (async () => {
+        try {
+          const { supabase } = await import('./services/supabaseClient');
+          // Generate signed URL valid for 1 hour
+          const { data, error } = await supabase.storage
+            .from('receipts')
+            .createSignedUrl(message.receiptPath, 3600);
+
+          if (error) {
+            console.error('Failed to generate signed URL for receipt:', error);
+            // Try public URL as fallback (in case bucket is actually public)
+            const publicUrl = `${import.meta.env.VITE_SUPABASE_URL}/storage/v1/object/public/receipts/${message.receiptPath}`;
+            setReceiptUrl(publicUrl);
+          } else {
+            setReceiptUrl(data.signedUrl);
+          }
+        } catch (err) {
+          console.error('Error generating signed URL:', err);
+          // Fallback to public URL
+          const publicUrl = `${import.meta.env.VITE_SUPABASE_URL}/storage/v1/object/public/receipts/${message.receiptPath}`;
+          setReceiptUrl(publicUrl);
+        } finally {
+          setIsLoadingReceipt(false);
+        }
+      })();
+    } else if (!message.receiptPath && !message.receiptImage) {
+      // No receipt at all
+      setReceiptUrl(null);
+      setIsLoadingReceipt(false);
+    }
+  }, [message.receiptPath, message.receiptImage]);
+
+  // Remove any URLs from text if receipt is attached separately
+  const textWithoutUrl = receiptUrl 
+    ? message.text.replace(/https?:\/\/[^\s]+/g, '').trim()
+    : message.text;
+  
+  return (
   <div className="flex justify-end mb-4">
     <div className="bg-fiscalia-accent-gold text-white rounded-lg p-4 max-w-lg">
-      <p>{message.text}</p>
+        {textWithoutUrl && <p className={receiptUrl ? "mb-2" : ""}>{textWithoutUrl}</p>}
+        {isLoadingReceipt && (
+          <div className={textWithoutUrl ? "mt-2 border-t border-white/20 pt-2" : ""}>
+            <div className="flex items-center gap-2">
+              <div className="w-16 h-16 bg-white/10 rounded border border-white/20 flex items-center justify-center">
+                <span className="text-xs text-white/70">Chargement...</span>
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-xs text-white/90 font-medium">📷 Reçu</p>
+              </div>
+            </div>
+          </div>
+        )}
+        {receiptUrl && !isLoadingReceipt && (
+          <div className={textWithoutUrl ? "mt-2 border-t border-white/20 pt-2" : ""}>
+            <div className="flex items-center gap-2">
+              <img
+                src={receiptUrl}
+                alt="Reçu"
+                className="w-16 h-16 object-cover rounded border border-white/20"
+                onError={async (e) => {
+                  // If image fails to load and we have a receiptPath, try regenerating the signed URL
+                  if (message.receiptPath && receiptUrl && !receiptUrl.startsWith('data:')) {
+                    try {
+                      const { supabase } = await import('./services/supabaseClient');
+                      const { data, error } = await supabase.storage
+                        .from('receipts')
+                        .createSignedUrl(message.receiptPath, 3600);
+                      
+                      if (!error && data) {
+                        // Update the image source with the new signed URL
+                        (e.target as HTMLImageElement).src = data.signedUrl;
+                        setReceiptUrl(data.signedUrl);
+                      } else {
+                        // Hide image if regeneration also fails
+                        (e.target as HTMLImageElement).style.display = 'none';
+                      }
+                    } catch (err) {
+                      console.error('Error regenerating signed URL:', err);
+                      (e.target as HTMLImageElement).style.display = 'none';
+                    }
+                  } else {
+                    // Hide image if it fails to load and we can't regenerate
+                    (e.target as HTMLImageElement).style.display = 'none';
+                  }
+                }}
+              />
+              <div className="flex-1 min-w-0">
+                <p className="text-xs text-white/90 font-medium">📷 Reçu</p>
+                {message.receiptOcrData?.vendor && (
+                  <p className="text-xs text-white/70 truncate">{message.receiptOcrData.vendor}</p>
+                )}
+                {message.receiptOcrData?.total && (
+                  <p className="text-xs text-white/70">{message.receiptOcrData.total.toFixed(2)} $</p>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
     </div>
   </div>
 );
+};
 
 // Screens
 
@@ -848,7 +1312,7 @@ export const DashboardScreen: React.FC<{ jobs: Job[], expenses: Expense[], categ
             return jobDate >= previousPeriodStart! && jobDate <= previousPeriodEnd!;
         });
         const previousExpenses = expenses.filter(expense => {
-            const expenseDate = new Date(expense.date);
+            const expenseDate = parseLocalDate(expense.date);
             return expenseDate >= previousPeriodStart! && expenseDate <= previousPeriodEnd!;
         });
 
@@ -1206,7 +1670,7 @@ export const JobDetailScreen: React.FC<{ job: Job; expenses: Expense[]; onBack: 
 
     return (
         <div className="space-y-6">
-            <button onClick={onBack} className="flex items-center gap-2 text-fiscalia-primary-dark/70 hover:text-fiscalia-primary-dark font-semibold">
+            <button type="button" onClick={onBack} className="flex items-center gap-2 text-fiscalia-primary-dark/70 hover:text-fiscalia-primary-dark font-semibold">
                 <ArrowLeftIcon className="w-5 h-5" />
                 Retour aux contrats
             </button>
@@ -1261,6 +1725,7 @@ export const JobDetailScreen: React.FC<{ job: Job; expenses: Expense[]; onBack: 
                         )}
                         {onDeleteJob && (
                             <button
+                                type="button"
                                 onClick={() => onDeleteJob(job.id, job.name)}
                                 className="p-1.5 text-fiscalia-primary-dark/50 hover:text-fiscalia-error hover:bg-fiscalia-error/10 rounded-lg transition-colors"
                                 title="Supprimer le contrat"
@@ -1301,13 +1766,14 @@ export const JobDetailScreen: React.FC<{ job: Job; expenses: Expense[]; onBack: 
                                     {expense.receiptImage && <PaperclipIcon className="w-5 h-5 text-fiscalia-accent-gold mt-1" />}
                                     <div>
                                         <p className="font-semibold text-fiscalia-primary-dark">{expense.name}</p>
-                                        <p className="text-sm text-fiscalia-primary-dark/70">{new Date(expense.date).toLocaleDateString('fr-CA', { year: 'numeric', month: 'long', day: 'numeric' })}</p>
+                                        <p className="text-sm text-fiscalia-primary-dark/70">{formatLocalDate(expense.date)}</p>
                                     </div>
                                 </div>
                                 <div className="flex items-center gap-2">
                                     <p className="font-semibold text-fiscalia-primary-dark">-{expense.amount.toLocaleString('fr-CA', { style: 'currency', currency: 'CAD' })}</p>
                                     {onEditExpense && (
                                         <button
+                                            type="button"
                                             onClick={() => onEditExpense(expense)}
                                             className="p-1.5 text-fiscalia-primary-dark/50 hover:text-fiscalia-accent-gold hover:bg-fiscalia-accent-gold/10 rounded-lg transition-colors"
                                             title="Modifier la dépense"
@@ -1317,6 +1783,7 @@ export const JobDetailScreen: React.FC<{ job: Job; expenses: Expense[]; onBack: 
                                     )}
                                     {onDeleteExpense && (
                                         <button
+                                            type="button"
                                             onClick={() => onDeleteExpense(String(expense.id), expense.name)}
                                             className="p-1.5 text-fiscalia-primary-dark/50 hover:text-fiscalia-error hover:bg-fiscalia-error/10 rounded-lg transition-colors"
                                             title="Supprimer la dépense"
@@ -1352,7 +1819,7 @@ export const JobDetailScreen: React.FC<{ job: Job; expenses: Expense[]; onBack: 
 };
 
 
-export const ExpensesScreen: React.FC<{ expenses: Expense[], jobs: Job[], categories: ExpenseCategory[], onAddExpense: () => void, onManageCategories: () => void, onEditExpense?: (expense: Expense) => void, onDeleteExpense?: (expenseId: string, expenseName: string) => Promise<void> | void }> = ({ expenses, jobs, categories, onAddExpense, onManageCategories, onEditExpense, onDeleteExpense }) => {
+export const ExpensesScreen: React.FC<{ expenses: Expense[], jobs: Job[], categories: ExpenseCategory[], onAddExpense: () => void, onManageCategories: () => void, onEditExpense?: (expense: Expense) => void, onDeleteExpense?: (expenseId: string, expenseName: string) => Promise<void> | void, onDeleteReceipt?: (expense: Expense) => Promise<void> | void }> = ({ expenses, jobs, categories, onAddExpense, onManageCategories, onEditExpense, onDeleteExpense, onDeleteReceipt }) => {
     const [searchTerm, setSearchTerm] = useState('');
     const [categoryFilter, setCategoryFilter] = useState<ExpenseCategory | 'Toutes'>('Toutes');
     const [jobFilter, setJobFilter] = useState<string | 'Tous'>('Tous'); // 'Tous' or jobId
@@ -1361,6 +1828,8 @@ export const ExpensesScreen: React.FC<{ expenses: Expense[], jobs: Job[], catego
     const [timeFilter, setTimeFilter] = useState<TimeFilter>('all');
     const [isDateRangeModalOpen, setIsDateRangeModalOpen] = useState(false);
     const [expandedExpenses, setExpandedExpenses] = useState<Record<string, boolean>>({});
+    const [selectedExpense, setSelectedExpense] = useState<Expense | null>(null);
+    const [isDetailModalOpen, setIsDetailModalOpen] = useState(false);
 
     const handleApplyDateRange = (start: string, end: string) => {
         setTimeFilter({ start, end });
@@ -1379,11 +1848,12 @@ export const ExpensesScreen: React.FC<{ expenses: Expense[], jobs: Job[], catego
         const filteredByDate = expenses.filter(expense => {
             if (timeFilter === 'all') return true;
 
-            const expenseDate = new Date(expense.date);
+            const expenseDate = parseLocalDate(expense.date);
             if (typeof timeFilter === 'object') {
-                const endDate = new Date(timeFilter.end);
+                const startDate = parseLocalDate(timeFilter.start);
+                const endDate = parseLocalDate(timeFilter.end);
                 endDate.setHours(23, 59, 59, 999);
-                return expenseDate >= new Date(timeFilter.start) && expenseDate <= endDate;
+                return expenseDate >= startDate && expenseDate <= endDate;
             }
             if (timeFilter === 'year') {
                 return expenseDate.getFullYear() === now.getFullYear();
@@ -1412,14 +1882,14 @@ export const ExpensesScreen: React.FC<{ expenses: Expense[], jobs: Job[], catego
 
         switch (sortBy) {
             case 'date-asc':
-                return [...filtered].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+                return [...filtered].sort((a, b) => parseLocalDate(a.date).getTime() - parseLocalDate(b.date).getTime());
             case 'amount-desc':
                 return [...filtered].sort((a, b) => b.amount - a.amount);
             case 'amount-asc':
                 return [...filtered].sort((a, b) => a.amount - b.amount);
             case 'date-desc':
             default:
-                return [...filtered].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+                return [...filtered].sort((a, b) => parseLocalDate(b.date).getTime() - parseLocalDate(a.date).getTime());
         }
     }, [expenses, searchTerm, categoryFilter, jobFilter, sortBy, timeFilter]);
     
@@ -1493,28 +1963,38 @@ export const ExpensesScreen: React.FC<{ expenses: Expense[], jobs: Job[], catego
                 ) : filteredAndSortedExpenses.length > 0 ? filteredAndSortedExpenses.map(expense => {
                     const isExpanded = Boolean(expandedExpenses[expense.id]);
                     return (
-                        <div key={expense.id} className="border border-fiscalia-primary-dark/10 rounded-lg p-3 bg-white shadow-sm mb-3 last:mb-0">
+                        <div key={expense.id} className="border border-fiscalia-primary-dark/10 rounded-lg p-3 bg-white shadow-sm mb-3 last:mb-0 hover:shadow-md transition-shadow">
                             <div className="flex items-start justify-between gap-4">
-                                <div className="flex items-start gap-3">
+                                <div className="flex items-start gap-3 flex-1 cursor-pointer" onClick={() => {
+                                    setSelectedExpense(expense);
+                                    setIsDetailModalOpen(true);
+                                }}>
                                     <button
                                         type="button"
-                                        onClick={() => toggleExpenseDetails(expense.id)}
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            toggleExpenseDetails(expense.id);
+                                        }}
                                         className="p-1 rounded-full text-fiscalia-primary-dark/60 hover:text-fiscalia-primary-dark hover:bg-fiscalia-primary-dark/10 transition-colors"
                                         aria-label={isExpanded ? 'Masquer les détails' : 'Afficher les détails'}
                                     >
                                         <ChevronRightIcon className={`w-4 h-4 transition-transform ${isExpanded ? 'rotate-90' : ''}`} />
                                     </button>
                                     {expense.receiptImage && <PaperclipIcon className="w-5 h-5 text-fiscalia-accent-gold mt-1" />}
-                                    <div>
+                                    <div className="flex-1">
                                         <p className="font-semibold text-fiscalia-primary-dark">{expense.name}</p>
-                                        <p className="text-sm text-fiscalia-primary-dark/70">{new Date(expense.date).toLocaleDateString('fr-CA', { year: 'numeric', month: 'long', day: 'numeric' })}</p>
+                                        <p className="text-sm text-fiscalia-primary-dark/70">{formatLocalDate(expense.date)}</p>
                                     </div>
                                 </div>
                                 <div className="flex items-center gap-2">
                                     <p className="font-semibold text-fiscalia-primary-dark">-{expense.amount.toLocaleString('fr-CA', { style: 'currency', currency: 'CAD' })}</p>
                                     {onEditExpense && (
                                         <button
-                                            onClick={() => onEditExpense(expense)}
+                                            type="button"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                onEditExpense(expense);
+                                            }}
                                             className="p-1.5 text-fiscalia-primary-dark/50 hover:text-fiscalia-accent-gold hover:bg-fiscalia-accent-gold/10 rounded-lg transition-colors"
                                             title="Modifier la dépense"
                                         >
@@ -1523,7 +2003,11 @@ export const ExpensesScreen: React.FC<{ expenses: Expense[], jobs: Job[], catego
                                     )}
                                     {onDeleteExpense && (
                                         <button
-                                            onClick={() => onDeleteExpense(String(expense.id), expense.name)}
+                                            type="button"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                onDeleteExpense(String(expense.id), expense.name);
+                                            }}
                                             className="p-1.5 text-fiscalia-primary-dark/50 hover:text-fiscalia-error hover:bg-fiscalia-error/10 rounded-lg transition-colors"
                                             title="Supprimer la dépense"
                                         >
@@ -1544,7 +2028,23 @@ export const ExpensesScreen: React.FC<{ expenses: Expense[], jobs: Job[], catego
                                             <span className="font-medium text-fiscalia-primary-dark">Notes:</span> {expense.notes}
                                         </p>
                                     )}
-                                    {!expense.jobId && !expense.vendor && !expense.notes && (
+                                    {expense.receiptImage && (
+                                        <div className="mt-2">
+                                            <button
+                                                type="button"
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    setSelectedExpense(expense);
+                                                    setIsDetailModalOpen(true);
+                                                }}
+                                                className="text-fiscalia-accent-gold hover:text-fiscalia-accent-gold/80 text-sm font-medium flex items-center gap-1"
+                                            >
+                                                <PaperclipIcon className="w-4 h-4" />
+                                                Voir le reçu
+                                            </button>
+                                        </div>
+                                    )}
+                                    {!expense.jobId && !expense.vendor && !expense.notes && !expense.receiptImage && (
                                         <p className="italic text-fiscalia-primary-dark/60">Aucune information supplémentaire.</p>
                                     )}
                                 </div>
@@ -1560,7 +2060,256 @@ export const ExpensesScreen: React.FC<{ expenses: Expense[], jobs: Job[], catego
                 )}
             </div>
         </Card>
+        {selectedExpense && (
+            <ExpenseDetailModal
+                expense={selectedExpense}
+                job={jobs.find(j => j.id === selectedExpense.jobId) || null}
+                isOpen={isDetailModalOpen}
+                onClose={() => {
+                    setIsDetailModalOpen(false);
+                    setSelectedExpense(null);
+                }}
+                onEdit={onEditExpense ? () => {
+                    setIsDetailModalOpen(false);
+                    onEditExpense(selectedExpense);
+                } : undefined}
+                onDelete={onDeleteExpense ? () => {
+                    setIsDetailModalOpen(false);
+                    onDeleteExpense(String(selectedExpense.id), selectedExpense.name);
+                    setSelectedExpense(null);
+                } : undefined}
+                onDeleteReceipt={onDeleteReceipt ? async () => {
+                    await onDeleteReceipt(selectedExpense);
+                    setSelectedExpense(null);
+                } : undefined}
+            />
+        )}
     </div>
+    );
+};
+
+interface ExpenseDetailModalProps {
+    expense: Expense;
+    job: Job | null;
+    isOpen: boolean;
+    onClose: () => void;
+    onEdit?: () => void;
+    onDelete?: () => void;
+    onDeleteReceipt?: (expense: Expense) => Promise<void> | void;
+}
+
+const ExpenseDetailModal: React.FC<ExpenseDetailModalProps> = ({ expense, job, isOpen, onClose, onEdit, onDelete, onDeleteReceipt }) => {
+    const [isDeletingReceipt, setIsDeletingReceipt] = useState(false);
+    const [receiptUrl, setReceiptUrl] = useState<string | null>(null);
+    const [isLoadingReceipt, setIsLoadingReceipt] = useState(false);
+
+    // Generate signed URL for receipt when modal opens and expense has a receipt
+    useEffect(() => {
+        if (!isOpen || !expense.receiptImage) {
+            setReceiptUrl(null);
+            return;
+        }
+
+        // If receiptImage is already a full URL (data URL or public URL), use it directly
+        if (expense.receiptImage.startsWith('data:') || expense.receiptImage.startsWith('http')) {
+            setReceiptUrl(expense.receiptImage);
+            return;
+        }
+
+        // If receiptImage is a storage path, generate a signed URL
+        // Extract path from URL if it's a full URL, otherwise use as-is
+        const extractPath = (urlOrPath: string): string => {
+            // If it's a full URL (public or signed), extract the path part
+            const match = urlOrPath.match(/\/storage\/v1\/object\/[^/]+\/receipts\/(.+)$/);
+            if (match) {
+                return match[1];
+            }
+            // If it's just a path (userId/filename.jpg), use it directly
+            // Also handle cases where it might be a data URL (shouldn't happen but be safe)
+            if (urlOrPath.includes('/') && !urlOrPath.startsWith('http') && !urlOrPath.startsWith('data:')) {
+                return urlOrPath;
+            }
+            // Fallback: return as-is (might be a path already)
+            return urlOrPath;
+        };
+
+        const receiptPath = extractPath(expense.receiptImage);
+        
+        setIsLoadingReceipt(true);
+        (async () => {
+            try {
+                const { supabase } = await import('./services/supabaseClient');
+                // Generate signed URL valid for 1 hour
+                const { data, error } = await supabase.storage
+                    .from('receipts')
+                    .createSignedUrl(receiptPath, 3600); // 1 hour expiry
+
+                if (error) {
+                    console.error('Failed to generate signed URL for receipt:', error);
+                    // Fallback: try to use the path as-is (might work if bucket is actually public)
+                    setReceiptUrl(expense.receiptImage);
+                } else {
+                    setReceiptUrl(data.signedUrl);
+                }
+            } catch (err) {
+                console.error('Error generating signed URL:', err);
+                setReceiptUrl(expense.receiptImage); // Fallback
+            } finally {
+                setIsLoadingReceipt(false);
+            }
+        })();
+    }, [isOpen, expense.receiptImage]);
+
+    const handleDeleteReceipt = async () => {
+        if (!expense.receiptImage || !window.confirm('Êtes-vous sûr de vouloir supprimer ce reçu ?')) {
+            return;
+        }
+
+        setIsDeletingReceipt(true);
+        try {
+            const { receiptService } = await import('./services/receiptService');
+            // Extract path from URL if needed
+            const extractPath = (urlOrPath: string): string => {
+                const match = urlOrPath.match(/\/storage\/v1\/object\/[^/]+\/receipts\/(.+)$/);
+                return match ? match[1] : urlOrPath;
+            };
+            const receiptPath = extractPath(expense.receiptImage);
+            
+            // Delete from storage using the path
+            const { supabase } = await import('./services/supabaseClient');
+            const { error } = await supabase.storage
+                .from('receipts')
+                .remove([receiptPath]);
+
+            if (error) {
+                console.error('Failed to delete receipt from storage:', error);
+            }
+
+            // Update expense to remove receipt image
+            if (onDeleteReceipt) {
+                await onDeleteReceipt(expense);
+            }
+        } catch (error) {
+            console.error('Failed to delete receipt:', error);
+            alert('Impossible de supprimer le reçu. Veuillez réessayer.');
+        } finally {
+            setIsDeletingReceipt(false);
+        }
+    };
+
+    return (
+        <Modal isOpen={isOpen} onClose={onClose} title="Détails de la dépense" size="lg">
+            <div className="space-y-6">
+                <div className="grid grid-cols-2 gap-4">
+                    <div>
+                        <p className="text-sm text-fiscalia-primary-dark/60 mb-1">Description</p>
+                        <p className="font-semibold text-fiscalia-primary-dark">{expense.name}</p>
+                    </div>
+                    <div>
+                        <p className="text-sm text-fiscalia-primary-dark/60 mb-1">Montant</p>
+                        <p className="font-semibold text-fiscalia-primary-dark text-lg">
+                            {expense.amount.toLocaleString('fr-CA', { style: 'currency', currency: 'CAD' })}
+                        </p>
+                    </div>
+                    <div>
+                        <p className="text-sm text-fiscalia-primary-dark/60 mb-1">Date</p>
+                        <p className="font-medium text-fiscalia-primary-dark">
+                            {formatLocalDate(expense.date)}
+                        </p>
+                    </div>
+                    <div>
+                        <p className="text-sm text-fiscalia-primary-dark/60 mb-1">Catégorie</p>
+                        <p className="font-medium text-fiscalia-primary-dark">{expense.category}</p>
+                    </div>
+                    {expense.vendor && (
+                        <div>
+                            <p className="text-sm text-fiscalia-primary-dark/60 mb-1">Fournisseur</p>
+                            <p className="font-medium text-fiscalia-primary-dark">{expense.vendor}</p>
+                        </div>
+                    )}
+                    {job && (
+                        <div>
+                            <p className="text-sm text-fiscalia-primary-dark/60 mb-1">Contrat</p>
+                            <p className="font-medium text-fiscalia-primary-dark">{job.name}</p>
+                        </div>
+                    )}
+                </div>
+
+                {expense.notes && (
+                    <div>
+                        <p className="text-sm text-fiscalia-primary-dark/60 mb-1">Notes</p>
+                        <p className="text-fiscalia-primary-dark whitespace-pre-wrap bg-fiscalia-light-neutral p-3 rounded-lg">
+                            {expense.notes}
+                        </p>
+                    </div>
+                )}
+
+                {expense.receiptImage && (
+                    <div>
+                        <div className="flex items-center justify-between mb-2">
+                            <p className="text-sm text-fiscalia-primary-dark/60">Reçu</p>
+                            <button
+                                type="button"
+                                onClick={handleDeleteReceipt}
+                                disabled={isDeletingReceipt}
+                                className="text-sm text-fiscalia-error hover:text-fiscalia-error/80 disabled:opacity-50 flex items-center gap-1"
+                            >
+                                <TrashIcon className="w-4 h-4" />
+                                {isDeletingReceipt ? 'Suppression...' : 'Supprimer le reçu'}
+                            </button>
+                        </div>
+                        <div className="border border-fiscalia-primary-dark/20 rounded-lg overflow-hidden bg-fiscalia-light-neutral">
+                            {isLoadingReceipt ? (
+                                <div className="flex items-center justify-center p-8">
+                                    <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-fiscalia-accent-gold"></div>
+                                    <span className="ml-3 text-fiscalia-primary-dark/70">Chargement du reçu...</span>
+                                </div>
+                            ) : receiptUrl ? (
+                                <img
+                                    src={receiptUrl}
+                                    alt="Reçu"
+                                    className="w-full h-auto max-h-96 object-contain"
+                                    onError={(e) => {
+                                        console.error('Failed to load receipt image');
+                                        (e.target as HTMLImageElement).style.display = 'none';
+                                        const parent = (e.target as HTMLImageElement).parentElement;
+                                        if (parent) {
+                                            parent.innerHTML = '<div class="p-8 text-center text-fiscalia-primary-dark/60">Impossible de charger le reçu</div>';
+                                        }
+                                    }}
+                                />
+                            ) : (
+                                <div className="p-8 text-center text-fiscalia-primary-dark/60">
+                                    Erreur lors du chargement du reçu
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                )}
+
+                <div className="flex justify-end gap-3 pt-4 border-t border-fiscalia-primary-dark/10">
+                    {onDelete && (
+                        <Button
+                            variant="secondary"
+                            onClick={onDelete}
+                            className="text-fiscalia-error hover:bg-fiscalia-error/10"
+                        >
+                            <TrashIcon className="w-4 h-4 mr-2" />
+                            Supprimer la dépense
+                        </Button>
+                    )}
+                    {onEdit && (
+                        <Button onClick={onEdit}>
+                            <PencilIcon className="w-4 h-4 mr-2" />
+                            Modifier
+                        </Button>
+                    )}
+                    <Button variant="secondary" onClick={onClose}>
+                        Fermer
+                    </Button>
+                </div>
+            </div>
+        </Modal>
     );
 };
 
@@ -1622,6 +2371,7 @@ export const ChatScreen: React.FC<{
     const [isListening, setIsListening] = useState(false);
     const [interimTranscript, setInterimTranscript] = useState('');
     const [error, setError] = useState<string | null>(null);
+    const [attachedReceipt, setAttachedReceipt] = useState<{ file: File; preview: string; ocrResult?: any } | null>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const pendingConversationCreationRef = useRef<Promise<string | null> | null>(null);
@@ -1810,19 +2560,179 @@ export const ChatScreen: React.FC<{
                 return;
             }
             try {
+                // Build conversation history, including receipt context from previous messages
                 const conversationHistory = baseMessages
                     .filter((msg) => msg.sender === 'user' || msg.sender === 'ai')
                     .slice(-10)
-                    .map((msg) => ({
-                        role: msg.sender === 'user' ? ('user' as const) : ('assistant' as const),
-                        content: msg.text,
-                    }));
+                    .map((msg) => {
+                        let content = msg.text;
+                        
+                        // If this is a user message with receipt data, include receipt context
+                        // This allows the AI to answer follow-up questions about the receipt
+                        if (msg.sender === 'user' && (msg.receiptPath || msg.receiptOcrData)) {
+                            const receiptContextParts: string[] = [];
+                            
+                            if (msg.receiptPath) {
+                                receiptContextParts.push(`chemin_reçu=${msg.receiptPath}`);
+                            }
+                            
+                            if (msg.receiptOcrData) {
+                                // Basic info
+                                const vendorPart = msg.receiptOcrData.vendor ? `fournisseur=${msg.receiptOcrData.vendor}` : '';
+                                const totalPart =
+                                    typeof msg.receiptOcrData.total === 'number' ? `total=${msg.receiptOcrData.total.toFixed(2)}` : '';
+                                const datePart = msg.receiptOcrData.date ? `date=${msg.receiptOcrData.date}` : '';
+                                const subtotalPart =
+                                    typeof msg.receiptOcrData.subtotal === 'number' ? `sous_total=${msg.receiptOcrData.subtotal.toFixed(2)}` : '';
+                                
+                                // Tax breakdown
+                                const taxParts: string[] = [];
+                                if (msg.receiptOcrData.tax) {
+                                    if (typeof msg.receiptOcrData.tax.gst === 'number') {
+                                        taxParts.push(`TPS=${msg.receiptOcrData.tax.gst.toFixed(2)}`);
+                                    }
+                                    if (typeof msg.receiptOcrData.tax.pst === 'number') {
+                                        taxParts.push(`TVP=${msg.receiptOcrData.tax.pst.toFixed(2)}`);
+                                    }
+                                    if (typeof msg.receiptOcrData.tax.qst === 'number') {
+                                        taxParts.push(`TVQ=${msg.receiptOcrData.tax.qst.toFixed(2)}`);
+                                    }
+                                    if (typeof msg.receiptOcrData.tax.hst === 'number') {
+                                        taxParts.push(`TVH=${msg.receiptOcrData.tax.hst.toFixed(2)}`);
+                                    }
+                                    if (typeof msg.receiptOcrData.tax.total === 'number' && !msg.receiptOcrData.tax.gst && !msg.receiptOcrData.tax.pst && !msg.receiptOcrData.tax.qst && !msg.receiptOcrData.tax.hst) {
+                                        taxParts.push(`taxe_totale=${msg.receiptOcrData.tax.total.toFixed(2)}`);
+                                    }
+                                }
+                                
+                                // Individual items - include ALL items (no limit)
+                                // Include items even if price is 0 (AI can infer from subtotal)
+                                const itemsPart = msg.receiptOcrData.items && msg.receiptOcrData.items.length > 0
+                                    ? `articles=[${msg.receiptOcrData.items.map(item => {
+                                        // Format price, show 0.00 if no price (AI will infer)
+                                        const priceStr = item.price > 0 ? item.price.toFixed(2) : '0.00';
+                                        return `${item.name}:${priceStr}`;
+                                    }).join('; ')}]`
+                                    : '';
+                                
+                                // Combine all parts
+                                const meta = [
+                                    vendorPart,
+                                    subtotalPart,
+                                    ...taxParts,
+                                    totalPart,
+                                    datePart,
+                                    itemsPart
+                                ].filter(Boolean).join(', ');
+                                
+                                if (meta) {
+                                    receiptContextParts.push(meta);
+                                }
+                                
+                                // Debug: Log items in conversation history
+                                if (msg.receiptOcrData?.items && msg.receiptOcrData.items.length > 0) {
+                                    console.log(`📝 Conversation history - Message ${msg.id} has ${msg.receiptOcrData.items.length} items:`, msg.receiptOcrData.items);
+                                }
+                            }
+                            
+                            // Append receipt context if we have any
+                            if (receiptContextParts.length > 0) {
+                                content = `${content}\n\n[reçu: ${receiptContextParts.join(' ; ')}]`;
+                                // Debug: Log the full content being sent
+                                if (receiptContextParts.some(part => part.includes('articles='))) {
+                                    console.log('✅ Conversation history includes items in receipt context');
+                                }
+                            }
+                        }
+                        
+                        return {
+                            role: msg.sender === 'user' ? ('user' as const) : ('assistant' as const),
+                            content,
+                        };
+                    });
 
                 const activeJobIds = new Set(jobs.map((job) => job.id));
                 const activeExpenses = expenses.filter((expense) => !expense.jobId || activeJobIds.has(expense.jobId));
 
                 const activeConversationMemory =
                     conversation && conversation.id === targetConversationId ? conversation.memorySummary ?? null : conversation?.memorySummary ?? null;
+                
+                // Extract receipt data from recent messages (last 10 messages)
+                // CRITICAL: Include the CURRENT message's receipt data if it exists
+                // Check the LAST message first (most recent) as it's likely the current receipt
+                const recentReceipts = baseMessages
+                    .slice(-10)
+                    .filter(msg => {
+                        // Include user messages with receipt data
+                        if (msg.sender === 'user' && msg.receiptOcrData) {
+                            return true;
+                        }
+                        // Also include if message has receiptPath (receipt was uploaded)
+                        if (msg.sender === 'user' && msg.receiptPath) {
+                            return true;
+                        }
+                        return false;
+                    })
+                    .map(msg => {
+                        // Map receiptOcrData to match ReceiptData interface structure
+                        // If receiptOcrData exists, use it; otherwise create minimal structure from receiptPath
+                        if (msg.receiptOcrData) {
+                            const data = msg.receiptOcrData;
+                            return {
+                                vendor: data.vendor,
+                                date: data.date,
+                                total: data.total,
+                                subtotal: data.subtotal,
+                                tax: data.tax,
+                                items: data.items?.map(item => ({
+                                    name: item.name,
+                                    price: item.price,
+                                    // Include quantity and unitPrice if available (from enhanced OCR)
+                                    quantity: 'quantity' in item ? item.quantity : undefined,
+                                    unitPrice: 'unitPrice' in item ? item.unitPrice : undefined,
+                                })),
+                                currency: 'currency' in data ? data.currency : undefined,
+                                receiptPath: msg.receiptPath,
+                            };
+                        } else if (msg.receiptPath) {
+                            // If we have receiptPath but no OCR data yet, include minimal structure
+                            // This helps AI know a receipt exists even if OCR is still processing
+                            return {
+                                receiptPath: msg.receiptPath,
+                            };
+                        }
+                        return null;
+                    })
+                    .filter((data): data is NonNullable<typeof data> => {
+                        // Only include receipts with meaningful data OR receiptPath
+                        return !!(data && (data.vendor || data.total || data.items?.length || data.receiptPath));
+                    });
+                
+                // Debug: Log receipt data being sent to AI
+                if (recentReceipts.length > 0) {
+                    console.log(`📋 Sending ${recentReceipts.length} receipt(s) to AI context:`, recentReceipts.map(r => ({
+                        vendor: r.vendor,
+                        total: r.total,
+                        itemsCount: r.items?.length || 0,
+                        hasTax: !!r.tax,
+                        taxComponents: r.tax ? Object.keys(r.tax) : [],
+                        hasReceiptPath: !!r.receiptPath,
+                    })));
+                    // Log full receipt data for debugging
+                    recentReceipts.forEach((r, idx) => {
+                        console.log(`📋 Receipt ${idx + 1} full data:`, JSON.stringify(r, null, 2));
+                    });
+                } else {
+                    console.warn('⚠️ No receipt data found in recent messages for AI context');
+                    console.warn('⚠️ Available messages:', baseMessages.slice(-5).map(m => ({
+                        id: m.id,
+                        sender: m.sender,
+                        hasReceiptPath: !!m.receiptPath,
+                        hasReceiptOcrData: !!m.receiptOcrData,
+                        receiptOcrDataKeys: m.receiptOcrData ? Object.keys(m.receiptOcrData) : [],
+                    })));
+                }
+                
                 const context = {
                     jobs,
                     expenses: activeExpenses,
@@ -1830,6 +2740,7 @@ export const ChatScreen: React.FC<{
                     currentDate: new Date().toISOString().split('T')[0],
                     conversationId: targetConversationId,
                     conversationMemory: activeConversationMemory,
+                    receipts: recentReceipts.length > 0 ? recentReceipts : undefined,
                 };
 
                 if (retryAttempt > 0) {
@@ -1867,11 +2778,12 @@ export const ChatScreen: React.FC<{
                 if (hasMutated) {
                     try {
                         // Add small delay to ensure database writes are committed
+                        // CRITICAL: This ensures the AI always has the latest state after mutations
                         await new Promise(resolve => setTimeout(resolve, 500));
                         
                         await Promise.resolve(onRequireRefresh?.());
                         
-                        console.log('Analytics and dashboard data refreshed successfully');
+                        console.log('Analytics and dashboard data refreshed successfully - AI context will be updated on next message');
                     } catch (refreshError) {
                         console.error('Failed to refresh data after actions', refreshError);
                         throw refreshError instanceof Error
@@ -1977,7 +2889,17 @@ export const ChatScreen: React.FC<{
     );
 
     const handleSend = async () => {
-        await sendMessage(input);
+        if (attachedReceipt) {
+            await handleSendWithReceipt();
+            return;
+        }
+        const messageToSend = input.trim();
+        if (!messageToSend) {
+            return;
+        }
+        setInput('');
+        setInterimTranscript('');
+        await sendMessage(messageToSend);
     };
 
     const handleMicrophoneClick = async () => {
@@ -2008,8 +2930,8 @@ export const ChatScreen: React.FC<{
         setError(null);
         setInterimTranscript('');
 
-        speechService.startListening(
-            (transcript: string) => {
+        const recognition = speechService.startListening(
+            (transcript: string, isFinal: boolean) => {
                 setInterimTranscript(transcript);
             },
             (errorMessage: string) => {
@@ -2018,16 +2940,495 @@ export const ChatScreen: React.FC<{
                 setInterimTranscript('');
             }
         );
+
+        if (!recognition) {
+            setIsListening(false);
+            setError("Impossible de démarrer la reconnaissance vocale");
+        }
     };
 
     const handleAttachmentClick = () => {
         fileInputRef.current?.click();
     };
 
-    const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-        if (event.target.files && event.target.files[0]) {
-            const fileName = event.target.files[0].name;
-            alert(`Reçu "${fileName}" sélectionné. La fonction d'analyse sera bientôt disponible.`);
+    const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+        if (!event.target.files || !event.target.files[0]) return;
+        
+        const file = event.target.files[0];
+
+        // Attempt to normalize image (resize/compress); allow large inputs
+        let preparedFile = file;
+        try {
+            const { prepareImageForOCR } = await import('./services/ocrService');
+            preparedFile = await prepareImageForOCR(file);
+        } catch (e) {
+            // If preparation fails (e.g., HEIC decode), show a clear message
+            if (/heic|heif/i.test(file.name) || /heic|heif/i.test(file.type)) {
+                setError("Le format HEIC/HEIF n'est pas supporté par ce navigateur. Veuillez convertir en JPEG/PNG/WebP (iPhone: Réglages > Appareil photo > Formats > 'Le plus compatible').");
+                return;
+            }
+            // Otherwise continue with the original file
+        }
+        
+        setError(null);
+        
+        // Create preview URL and attach receipt WITHOUT processing OCR yet
+        const preview = URL.createObjectURL(preparedFile);
+        
+        // Attach receipt to chat - OCR will be done when message is sent
+        setAttachedReceipt({
+            file: preparedFile,
+            preview,
+            ocrResult: undefined, // Will be processed when sending
+        });
+        
+        // Clear file input
+        if (fileInputRef.current) {
+            fileInputRef.current.value = '';
+        }
+    };
+    
+    const handleRemoveAttachedReceipt = () => {
+        if (attachedReceipt?.preview) {
+            URL.revokeObjectURL(attachedReceipt.preview);
+        }
+        setAttachedReceipt(null);
+    };
+    
+    const handleSendWithReceipt = async () => {
+        if (!attachedReceipt) {
+            await handleSend();
+            return;
+        }
+        
+        const messageText = input.trim() || 'Analysez ce reçu';
+        if (isLoading) return;
+        
+            const targetConversationId = await ensureConversationReady();
+            if (!targetConversationId) {
+            setError("Impossible de démarrer la conversation. Veuillez réessayer.");
+            return;
+        }
+        
+        setIsLoading(true);
+        setError(null);
+        
+        try {
+            // Get current user
+            const user = await authService.getUser();
+            if (!user) {
+                throw new Error("Utilisateur non authentifié");
+            }
+
+            // Capture current attached receipt so we can clear UI immediately
+            const currentReceipt = attachedReceipt;
+
+            // 1) Immediately add the user message with blob URL for instant display
+            const userMessage: ChatMessage = {
+                id: createMessageId('user'),
+                conversationId: targetConversationId,
+                sender: 'user',
+                text: messageText,
+                timestamp: new Date().toISOString(),
+                // Use local preview URL for instant display - image appears immediately
+                receiptImage: currentReceipt?.preview,
+            };
+
+            setInput('');
+            setInterimTranscript('');
+            // Clear attachment UI without revoking the preview URL (keeps thumbnail alive)
+            setAttachedReceipt(null);
+
+            const updatedMessages = await appendMessage(targetConversationId, userMessage);
+            await onFirstUserMessage(targetConversationId, userMessage.text);
+
+            // 2) Upload receipt to storage (but enhanced OCR will handle this, so this is fallback)
+            // Image already displays via blob URL, so this doesn't block UI
+            let receiptPath: string | undefined;
+            let receiptUrl: string | undefined;
+            let receiptUploaded = false; // Track if upload was done by enhanced OCR
+            
+            // Note: Enhanced OCR will upload the receipt automatically
+            // We only upload here as a fallback if not using enhanced OCR
+
+            // 3) Start OCR processing - we'll wait for it before sending to AI
+            // Enhanced OCR includes AI-powered parsing, so we want to wait for complete data
+            let receiptOcrData:
+                | {
+                      vendor?: string;
+                      total?: number;
+                      date?: string;
+                      rawText?: string;
+                      items?: Array<{ name: string; price: number }>;
+                      subtotal?: number;
+                      tax?: {
+                          gst?: number;
+                          pst?: number;
+                          qst?: number;
+                          hst?: number;
+                          total?: number;
+                      };
+                  }
+                | undefined;
+
+            // Start OCR with enhanced server-side processing (when user is authenticated)
+            // Use enhanced OCR for better reliability and AI-powered parsing
+            const ocrPromise = (async () => {
+                try {
+                    if (currentReceipt?.file) {
+                        console.log('[OCR] Starting OCR processing for receipt file...');
+                        
+                        // Use server-side OCR only (requires authenticated user)
+                        let ocrResult: Awaited<ReturnType<typeof processReceiptEnhanced>> | null = null;
+                        
+                        const { data: { session } } = await supabase.auth.getSession();
+                        if (!session?.user) {
+                            console.error('[OCR] User not authenticated - cannot process receipt');
+                            return; // Skip this receipt if user is not authenticated
+                        }
+                        
+                        try {
+                            // Use enhanced server-side OCR with AI-powered parsing
+                            const { processReceiptEnhanced } = await import('./services/ocrService');
+                            console.log('[OCR] Using enhanced server-side OCR...');
+                            ocrResult = await processReceiptEnhanced(currentReceipt.file, session.user.id);
+                            
+                            // Enhanced OCR already uploaded the receipt
+                            if (ocrResult && 'receiptPath' in ocrResult && ocrResult.receiptPath) {
+                                receiptPath = ocrResult.receiptPath;
+                                receiptUploaded = true;
+                                // Get public URL
+                                const { data: urlData } = supabase.storage
+                                    .from('receipts')
+                                    .getPublicUrl(ocrResult.receiptPath);
+                                receiptUrl = urlData.publicUrl;
+                                console.log('[OCR] Receipt uploaded by enhanced OCR:', receiptPath);
+                            }
+                        } catch (enhancedError) {
+                            console.error('[OCR] Enhanced OCR failed:', enhancedError);
+                            // No fallback - server-side OCR is required
+                            return; // Skip this receipt if OCR fails
+                        }
+                        
+                        // Upload receipt if not already uploaded by enhanced OCR
+                        if (!receiptUploaded && currentReceipt?.file && !receiptPath) {
+                            try {
+                                const filename = `${user.id}/${crypto.randomUUID()}.${(currentReceipt.file.name.split('.').pop() || 'jpg')}`;
+                                const { data, error: uploadError } = await supabase.storage
+                                    .from('receipts')
+                                    .upload(filename, currentReceipt.file, {
+                                        contentType: currentReceipt.file.type,
+                                        upsert: false,
+                                    });
+
+                                if (uploadError) {
+                                    console.error('Failed to upload receipt:', uploadError);
+                                } else {
+                                    receiptPath = data?.path;
+                                    // Get public URL for the receipt
+                                    const { data: urlData } = supabase.storage
+                                        .from('receipts')
+                                        .getPublicUrl(filename);
+                                    receiptUrl = urlData.publicUrl;
+                                }
+                            } catch (uploadErr) {
+                                console.error('Upload error:', uploadErr);
+                            }
+                        }
+                        
+                        // Always return data if we have OCR result, even if parsing partially failed
+                        if (ocrResult) {
+                            console.log('[OCR] OCR result received:', {
+                                success: ocrResult.ocrResult?.success,
+                                hasText: !!ocrResult.rawText,
+                                hasVendor: !!ocrResult.vendor,
+                                hasTotal: !!ocrResult.total,
+                                hasItems: !!ocrResult.items,
+                                itemsCount: ocrResult.items?.length || 0
+                            });
+                            
+                            // Only process if OCR extraction was successful (even if parsing found no items)
+                            if (ocrResult.ocrResult?.success && ocrResult.rawText) {
+                                // Normalize date to ISO format (YYYY-MM-DD) if possible
+                                let normalizedDate: string | undefined = ocrResult.date;
+                                if (ocrResult.date) {
+                                    try {
+                                        // Try to parse the date and convert to ISO format
+                                        // Use parseLocalDate to avoid timezone issues
+                                        const parsedDate = parseLocalDate(ocrResult.date);
+                                        if (!isNaN(parsedDate.getTime())) {
+                                            // Convert local date back to YYYY-MM-DD string
+                                            const year = parsedDate.getFullYear();
+                                            const month = String(parsedDate.getMonth() + 1).padStart(2, '0');
+                                            const day = String(parsedDate.getDate()).padStart(2, '0');
+                                            normalizedDate = `${year}-${month}-${day}`;
+                                        } else {
+                                            // If parsing fails, try common date formats
+                                            const dateStr = ocrResult.date.trim();
+                                            // Try DD/MM/YYYY or MM/DD/YYYY
+                                            const ddmmyyyy = dateStr.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})/);
+                                            if (ddmmyyyy) {
+                                                const [, day, month, year] = ddmmyyyy;
+                                                normalizedDate = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+                                            } else {
+                                                // Keep original if we can't parse it - AI will handle it
+                                                normalizedDate = ocrResult.date;
+                                            }
+                                        }
+                                    } catch (dateErr) {
+                                        // If date parsing fails, keep original - AI will handle conversion
+                                        normalizedDate = ocrResult.date;
+                                    }
+                                }
+                                
+                                return {
+                                    vendor: ocrResult.vendor,
+                                    total: ocrResult.total,
+                                    date: normalizedDate,
+                                    rawText: ocrResult.rawText?.substring(0, 1000),
+                                    items: ocrResult.items || [], // Ensure items is always an array
+                                    subtotal: ocrResult.subtotal,
+                                    tax: ocrResult.tax,
+                                };
+                            } else {
+                                console.warn('[OCR] OCR extraction failed:', {
+                                    success: ocrResult.ocrResult?.success,
+                                    error: ocrResult.ocrResult?.error,
+                                    hasText: !!ocrResult.rawText
+                                });
+                                // Even if OCR failed, return partial data if we have anything
+                                if (ocrResult.vendor || ocrResult.total || ocrResult.items?.length) {
+                                    return {
+                                        vendor: ocrResult.vendor,
+                                        total: ocrResult.total,
+                                        date: ocrResult.date,
+                                        rawText: ocrResult.rawText?.substring(0, 1000),
+                                        items: ocrResult.items || [],
+                                        subtotal: ocrResult.subtotal,
+                                        tax: ocrResult.tax,
+                                    };
+                                }
+                            }
+                        } else {
+                            console.warn('[OCR] processReceiptEnhanced returned null/undefined');
+                        }
+                    } else {
+                        console.warn('[OCR] No receipt file available');
+                    }
+                } catch (ocrErr) {
+                    console.error('[OCR] OCR processing error:', ocrErr);
+                    // Re-throw to be caught by outer handler
+                    throw ocrErr;
+                }
+                // Return undefined if OCR failed or is still processing
+                return undefined;
+            })();
+
+            // Wait for OCR to complete, but don't block too long
+            // Increased timeout to 12 seconds for enhanced OCR (may take longer for AI parsing)
+            // This ensures items are extracted even from complex receipt formats
+            try {
+                receiptOcrData = await Promise.race([
+                    ocrPromise,
+                    new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 12000)), // 12 second timeout for enhanced OCR
+                ]);
+                
+                // Log what we got (or didn't get)
+                if (receiptOcrData) {
+                    console.log('[OCR] ✅ OCR data received:', {
+                        hasVendor: !!receiptOcrData.vendor,
+                        hasTotal: !!receiptOcrData.total,
+                        hasItems: !!receiptOcrData.items,
+                        itemsCount: receiptOcrData.items?.length || 0,
+                        hasSubtotal: !!receiptOcrData.subtotal,
+                        hasTax: !!receiptOcrData.tax,
+                        taxComponents: receiptOcrData.tax ? Object.keys(receiptOcrData.tax) : [],
+                    });
+                    console.log('[OCR] Full receipt data:', JSON.stringify(receiptOcrData, null, 2));
+                } else {
+                    console.warn('[OCR] ⚠️ OCR promise returned undefined - this could mean OCR is still processing or failed');
+                    console.warn('[OCR] This will cause AI to not have receipt data. Check OCR function logs.');
+                }
+            } catch (err) {
+                console.error('[OCR] ❌ OCR timeout or error:', err);
+                // Continue without OCR data - AI can still process with receiptPath
+            }
+
+            // 4) Update message with receipt path, URL, and OCR data (if available)
+            // Update the messages array directly for AI processing
+            // CRITICAL: Ensure receiptOcrData is included even if partial
+            let messagesWithReceipt: ChatMessage[] = updatedMessages.map((msg) =>
+                msg.id === userMessage.id
+                    ? {
+                          ...msg,
+                          receiptPath: receiptPath ?? msg.receiptPath,
+                          // Store public URL for persistence - replaces blob URL
+                          // This ensures image works on refresh/return
+                          receiptImage: receiptUrl ?? msg.receiptImage,
+                          receiptOcrData: receiptOcrData ?? msg.receiptOcrData,
+                      }
+                    : msg
+            );
+            
+            // Debug: Verify receipt data is in the message
+            const messageWithReceiptData = messagesWithReceipt.find(m => m.id === userMessage.id);
+            if (messageWithReceiptData) {
+                console.log('[OCR] Message receipt data status:', {
+                    hasReceiptPath: !!messageWithReceiptData.receiptPath,
+                    hasReceiptOcrData: !!messageWithReceiptData.receiptOcrData,
+                    receiptOcrDataKeys: messageWithReceiptData.receiptOcrData ? Object.keys(messageWithReceiptData.receiptOcrData) : [],
+                    itemsCount: messageWithReceiptData.receiptOcrData?.items?.length || 0,
+                });
+            }
+
+            // Persist the update to database (async, don't block)
+            if (receiptPath || receiptUrl || receiptOcrData) {
+                await Promise.resolve(
+                    onMessagesChange(
+                        targetConversationId,
+                        (previous): ChatMessage[] => {
+                            return previous.map((msg) =>
+                                msg.id === userMessage.id
+                                    ? {
+                                          ...msg,
+                                          receiptPath: receiptPath ?? msg.receiptPath,
+                                          receiptImage: receiptUrl ?? msg.receiptImage,
+                                          receiptOcrData: receiptOcrData ?? msg.receiptOcrData,
+                                      }
+                                    : msg
+                            );
+                        }
+                    )
+                );
+            }
+
+            // 5) Build receipt context for AI with all extracted details
+            // This includes: vendor, total, date, subtotal, tax breakdown, and individual items
+            const receiptContextParts: string[] = [];
+            if (receiptPath) {
+                receiptContextParts.push(`chemin_reçu=${receiptPath}`);
+            }
+            if (receiptOcrData) {
+                // Basic info
+                const vendorPart = receiptOcrData.vendor ? `fournisseur=${receiptOcrData.vendor}` : '';
+                const totalPart =
+                    typeof receiptOcrData.total === 'number' ? `total=${receiptOcrData.total.toFixed(2)}` : '';
+                const datePart = receiptOcrData.date ? `date=${receiptOcrData.date}` : '';
+                const subtotalPart =
+                    typeof receiptOcrData.subtotal === 'number' ? `sous_total=${receiptOcrData.subtotal.toFixed(2)}` : '';
+                
+                // Tax breakdown
+                const taxParts: string[] = [];
+                if (receiptOcrData.tax) {
+                    if (typeof receiptOcrData.tax.gst === 'number') {
+                        taxParts.push(`TPS=${receiptOcrData.tax.gst.toFixed(2)}`);
+                    }
+                    if (typeof receiptOcrData.tax.pst === 'number') {
+                        taxParts.push(`TVP=${receiptOcrData.tax.pst.toFixed(2)}`);
+                    }
+                    if (typeof receiptOcrData.tax.qst === 'number') {
+                        taxParts.push(`TVQ=${receiptOcrData.tax.qst.toFixed(2)}`);
+                    }
+                    if (typeof receiptOcrData.tax.hst === 'number') {
+                        taxParts.push(`TVH=${receiptOcrData.tax.hst.toFixed(2)}`);
+                    }
+                    if (typeof receiptOcrData.tax.total === 'number' && !receiptOcrData.tax.gst && !receiptOcrData.tax.pst && !receiptOcrData.tax.qst && !receiptOcrData.tax.hst) {
+                        taxParts.push(`taxe_totale=${receiptOcrData.tax.total.toFixed(2)}`);
+                    }
+                }
+                
+                // Individual items - include ALL items (no limit)
+                // Include items even if price is 0 (AI can infer from subtotal)
+                const itemsPart = receiptOcrData.items && receiptOcrData.items.length > 0
+                    ? `articles=[${receiptOcrData.items.map(item => {
+                        // Format price, show 0.00 if no price (AI will infer)
+                        const priceStr = item.price > 0 ? item.price.toFixed(2) : '0.00';
+                        return `${item.name}:${priceStr}`;
+                    }).join('; ')}]`
+                    : '';
+                
+                // Combine all parts
+                const meta = [
+                    vendorPart,
+                    subtotalPart,
+                    ...taxParts,
+                    totalPart,
+                    datePart,
+                    itemsPart
+                ].filter(Boolean).join(', ');
+                
+                if (meta) {
+                    receiptContextParts.push(meta);
+                }
+            }
+
+            const receiptContext =
+                receiptContextParts.length > 0
+                    ? `\n\n[reçu: ${receiptContextParts.join(' ; ')}]`
+                    : '';
+
+            const messageWithReceiptContext = `${messageText}${receiptContext}`;
+            
+            // Debug: Log receipt context to help troubleshoot
+            if (receiptContext) {
+                console.log('📋 Receipt context sent to AI:', receiptContext);
+                console.log('📦 Receipt OCR Data:', receiptOcrData);
+                if (receiptOcrData?.items) {
+                    console.log(`✅ Items found: ${receiptOcrData.items.length} items`, receiptOcrData.items);
+                } else {
+                    console.warn('⚠️ No items in receiptOcrData!', receiptOcrData);
+                }
+            } else {
+                console.warn('⚠️ No receipt context generated!', { receiptPath, receiptOcrData });
+            }
+
+            // 6) Continue OCR in background and update message when complete
+            // If OCR completes after AI call, update message with full details for future questions
+            // Also re-send AI message if items were missing initially
+            ocrPromise.then((finalOcrData) => {
+                if (finalOcrData) {
+                    // Check if we got more complete data (e.g., items or tax that weren't available initially)
+                    const hasMoreData = (finalOcrData.items?.length || 0) > (receiptOcrData?.items?.length || 0) ||
+                        (finalOcrData.tax && !receiptOcrData?.tax) ||
+                        (finalOcrData.subtotal && !receiptOcrData?.subtotal);
+                    
+                    // If we initially had no items but now we do, this is critical - update and notify
+                    const hasItemsNow = (finalOcrData.items?.length || 0) > 0;
+                    const hadNoItemsBefore = !receiptOcrData || !receiptOcrData.items || receiptOcrData.items.length === 0;
+                    
+                    if (hasMoreData) {
+                        // OCR completed with more details - update message for future reference
+                        onMessagesChange(
+                            targetConversationId,
+                            (previous): ChatMessage[] => {
+                                return previous.map((msg) =>
+                                    msg.id === userMessage.id
+                                        ? {
+                                              ...msg,
+                                              receiptOcrData: finalOcrData,
+                                          }
+                                        : msg
+                                );
+                            }
+                        );
+                        
+                        // If items were missing initially but are now available, log for debugging
+                        if (hasItemsNow && hadNoItemsBefore) {
+                            console.log(`✅ OCR completed with ${finalOcrData.items.length} items (was missing initially). Future messages will have items.`);
+                        }
+                    }
+                }
+            }).catch((err) => {
+                console.error('Background OCR update error:', err);
+            });
+
+            // 7) Call AI with receipt context (receiptPath is required, OCR is optional)
+            await processAIMessage(targetConversationId, messageWithReceiptContext, messagesWithReceipt);
+        } catch (err) {
+            console.error('Failed to send message with receipt:', err);
+            setError(err instanceof Error ? err.message : 'Erreur lors de l\'envoi du message');
+        } finally {
+            setIsLoading(false);
         }
     };
 
@@ -2058,6 +3459,7 @@ export const ChatScreen: React.FC<{
                         <p className="text-sm text-fiscalia-primary-dark/70">Assistant Fiscalia</p>
                     </div>
                     <button
+                        type="button"
                         onClick={handleNewConversation}
                         className="p-2 text-fiscalia-primary-dark/50 hover:text-fiscalia-primary-dark hover:bg-fiscalia-light-neutral rounded-lg transition-colors"
                         title="Nouvelle conversation"
@@ -2100,7 +3502,7 @@ export const ChatScreen: React.FC<{
             </div>
             <div className="p-4 border-t border-fiscalia-primary-dark/10 bg-white rounded-b-lg">
                 <div className="relative">
-                    <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
+                    <input type="file" ref={fileInputRef} onChange={handleFileChange} accept="image/*" className="hidden" />
                     <input
                         type="text"
                         value={displayInput}
@@ -2126,6 +3528,7 @@ export const ChatScreen: React.FC<{
                     />
                     <div className="absolute inset-y-0 right-0 flex items-center pr-2">
                         <button
+                            type="button"
                             onClick={handleAttachmentClick}
                             className="p-2 text-fiscalia-primary-dark/50 hover:text-fiscalia-accent-gold transition-colors"
                             disabled={isLoading || isListening || !isConversationReady}
@@ -2134,6 +3537,7 @@ export const ChatScreen: React.FC<{
                         </button>
                         {isSpeechSupported && (
                             <button
+                                type="button"
                                 onClick={handleMicrophoneClick}
                                 className={`p-2 transition-colors ${
                                     isListening
@@ -2147,14 +3551,45 @@ export const ChatScreen: React.FC<{
                             </button>
                         )}
                         <button
+                            type="button"
                             onClick={handleSend}
                             className="p-2 rounded-md bg-fiscalia-accent-gold text-white hover:brightness-105 transition-all disabled:bg-fiscalia-primary-dark/20 disabled:cursor-not-allowed"
-                            disabled={isLoading || !displayInput.trim() || isListening}
+                            disabled={isLoading || (!displayInput.trim() && !attachedReceipt) || isListening}
                         >
                             <SendIcon className="w-6 h-6" />
                         </button>
                     </div>
                 </div>
+                {attachedReceipt && (
+                    <div className="mt-2 p-3 bg-fiscalia-light-neutral rounded-lg border border-fiscalia-primary-dark/20 flex items-start gap-3">
+                        <div className="flex-shrink-0 w-20 h-20 border border-fiscalia-primary-dark/20 rounded overflow-hidden bg-white">
+                            <img
+                                src={attachedReceipt.preview}
+                                alt="Reçu attaché"
+                                className="w-full h-full object-contain"
+                            />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                            <p className="text-sm font-medium text-fiscalia-primary-dark mb-1">
+                                📷 Reçu attaché
+                            </p>
+                            <p className="text-xs text-fiscalia-primary-dark/70">
+                                {attachedReceipt.file.name}
+                            </p>
+                            <p className="text-xs text-fiscalia-primary-dark/50 italic">
+                                L'analyse sera effectuée lors de l'envoi
+                            </p>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={handleRemoveAttachedReceipt}
+                            className="flex-shrink-0 p-1 text-fiscalia-primary-dark/50 hover:text-fiscalia-error transition-colors"
+                            title="Retirer le reçu"
+                        >
+                            <XMarkIcon className="w-5 h-5" />
+                        </button>
+                    </div>
+                )}
             </div>
         </div>
     );
@@ -2179,6 +3614,10 @@ export const SettingsScreen: React.FC<{ userProfile: UserProfile; onUpdateProfil
         confirmPassword: ''
     });
     const [showPasswordFields, setShowPasswordFields] = useState(false);
+    const [isChangingPassword, setIsChangingPassword] = useState(false);
+    const [isRequestingReset, setIsRequestingReset] = useState(false);
+    const [passwordError, setPasswordError] = useState<string | null>(null);
+    const [passwordSuccess, setPasswordSuccess] = useState<string | null>(null);
     const [notifications, setNotifications] = useState({
         email: true,
         push: true,
@@ -2228,32 +3667,62 @@ export const SettingsScreen: React.FC<{ userProfile: UserProfile; onUpdateProfil
     const renderSettingsContent = () => {
         switch (selectedSection) {
             case 'personal':
-                const handlePasswordChange = () => {
+                const handlePasswordChange = async () => {
+                    setPasswordError(null);
+                    setPasswordSuccess(null);
+
+                    if (!passwordChange.currentPassword) {
+                        setPasswordError('Veuillez entrer votre mot de passe actuel');
+                        return;
+                    }
+
                     if (passwordChange.newPassword !== passwordChange.confirmPassword) {
-                        alert('Les mots de passe ne correspondent pas');
+                        setPasswordError('Les mots de passe ne correspondent pas');
                         return;
                     }
+
                     if (passwordChange.newPassword.length < 8) {
-                        alert('Le mot de passe doit contenir au moins 8 caractères');
+                        setPasswordError('Le mot de passe doit contenir au moins 8 caractères');
                         return;
                     }
-                    // Handle password change logic here
-                    alert('Mot de passe modifié avec succès');
-                    setPasswordChange({
-                        currentPassword: '',
-                        newPassword: '',
-                        confirmPassword: ''
-                    });
-                    setShowPasswordFields(false);
+
+                    setIsChangingPassword(true);
+                    try {
+                        await authService.changePassword(passwordChange.currentPassword, passwordChange.newPassword);
+                        setPasswordSuccess('Mot de passe modifié avec succès');
+                        setPasswordChange({
+                            currentPassword: '',
+                            newPassword: '',
+                            confirmPassword: ''
+                        });
+                        setShowPasswordFields(false);
+                    } catch (error) {
+                        console.error('Failed to change password', error);
+                        setPasswordError(error instanceof Error ? error.message : 'Erreur lors du changement de mot de passe');
+                    } finally {
+                        setIsChangingPassword(false);
+                    }
                 };
 
-                const handlePasswordReset = () => {
+                const handlePasswordReset = async () => {
+                    setPasswordError(null);
+                    setPasswordSuccess(null);
+
                     if (!email) {
-                        alert('Veuillez d\'abord entrer votre adresse email');
+                        setPasswordError('Veuillez d\'abord entrer votre adresse email');
                         return;
                     }
-                    // Handle password reset logic here
-                    alert(`Un email de réinitialisation a été envoyé à ${email}`);
+
+                    setIsRequestingReset(true);
+                    try {
+                        await authService.requestPasswordReset(email);
+                        setPasswordSuccess(`Un email de réinitialisation a été envoyé à ${email}. Vérifiez votre boîte de réception.`);
+                    } catch (error) {
+                        console.error('Failed to request password reset', error);
+                        setPasswordError(error instanceof Error ? error.message : 'Erreur lors de l\'envoi de l\'email de réinitialisation');
+                    } finally {
+                        setIsRequestingReset(false);
+                    }
                 };
 
                 return (
@@ -2308,13 +3777,33 @@ export const SettingsScreen: React.FC<{ userProfile: UserProfile; onUpdateProfil
                         <div className="pt-4 border-t border-fiscalia-primary-dark/10">
                             <h3 className="text-xl font-medium text-fiscalia-primary-dark font-display mb-4">Mot de passe</h3>
                             
+                            {passwordError && (
+                                <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
+                                    <p className="text-red-800 text-sm">{passwordError}</p>
+                                </div>
+                            )}
+                            
+                            {passwordSuccess && (
+                                <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded-lg">
+                                    <p className="text-green-800 text-sm">{passwordSuccess}</p>
+                                </div>
+                            )}
+                            
                             {!showPasswordFields ? (
                                 <div className="space-y-3">
-                                    <Button variant="secondary" onClick={() => setShowPasswordFields(true)}>
+                                    <Button variant="secondary" onClick={() => {
+                                        setShowPasswordFields(true);
+                                        setPasswordError(null);
+                                        setPasswordSuccess(null);
+                                    }}>
                                         Modifier le mot de passe
                                     </Button>
-                                    <Button variant="secondary" onClick={handlePasswordReset}>
-                                        Réinitialiser le mot de passe par email
+                                    <Button 
+                                        variant="secondary" 
+                                        onClick={handlePasswordReset}
+                                        disabled={isRequestingReset}
+                                    >
+                                        {isRequestingReset ? 'Envoi en cours...' : 'Réinitialiser le mot de passe par email'}
                                     </Button>
                                 </div>
                             ) : (
@@ -2351,15 +3840,26 @@ export const SettingsScreen: React.FC<{ userProfile: UserProfile; onUpdateProfil
                                         />
                                     </div>
                                     <div className="flex gap-3">
-                                        <Button onClick={handlePasswordChange}>Enregistrer le nouveau mot de passe</Button>
-                                        <Button variant="secondary" onClick={() => {
-                                            setShowPasswordFields(false);
-                                            setPasswordChange({
-                                                currentPassword: '',
-                                                newPassword: '',
-                                                confirmPassword: ''
-                                            });
-                                        }}>
+                                        <Button 
+                                            onClick={handlePasswordChange}
+                                            disabled={isChangingPassword}
+                                        >
+                                            {isChangingPassword ? 'Modification en cours...' : 'Enregistrer le nouveau mot de passe'}
+                                        </Button>
+                                        <Button 
+                                            variant="secondary" 
+                                            onClick={() => {
+                                                setShowPasswordFields(false);
+                                                setPasswordError(null);
+                                                setPasswordSuccess(null);
+                                                setPasswordChange({
+                                                    currentPassword: '',
+                                                    newPassword: '',
+                                                    confirmPassword: ''
+                                                });
+                                            }}
+                                            disabled={isChangingPassword}
+                                        >
                                             Annuler
                                         </Button>
                                     </div>
@@ -2970,6 +4470,7 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({ isOpen, onClos
     const [notes, setNotes] = useState('');
     const [isProcessing, setIsProcessing] = useState(false);
     const [isSubmitting, setIsSubmitting] = useState(false);
+    const [showReceiptScanner, setShowReceiptScanner] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     const isEditMode = mode === 'edit' && Boolean(initialExpense);
@@ -2983,9 +4484,17 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({ isOpen, onClos
         const today = new Date().toISOString().split('T')[0];
 
         if (isEditMode && initialExpense) {
-            const normalizedDate = /^\d{4}-\d{2}-\d{2}$/.test(initialExpense.date)
-                ? initialExpense.date
-                : new Date(initialExpense.date).toISOString().split('T')[0];
+            let normalizedDate: string;
+            if (/^\d{4}-\d{2}-\d{2}$/.test(initialExpense.date)) {
+                normalizedDate = initialExpense.date;
+            } else {
+                // Parse as local date to avoid timezone issues
+                const parsed = parseLocalDate(initialExpense.date);
+                const year = parsed.getFullYear();
+                const month = String(parsed.getMonth() + 1).padStart(2, '0');
+                const day = String(parsed.getDate()).padStart(2, '0');
+                normalizedDate = `${year}-${month}-${day}`;
+            }
 
             setName(initialExpense.name);
             setAmount(initialExpense.amount);
@@ -3027,14 +4536,133 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({ isOpen, onClos
         }
     };
     
-    const handleAIProcess = async () => {
-        if (!receiptImage) return;
-        setIsProcessing(true);
+    const handleReceiptProcessed = async (result: any) => {
+        setShowReceiptScanner(false);
         
-        // AI functionality has been removed
-        alert("Désolé, la fonctionnalité d'analyse de reçu par IA n'est plus disponible.");
+        // Parse date once
+        let normalizedDate = date; // Default to current form date
+        if (result.date) {
+            try {
+                const parsedDate = parseLocalDate(result.date);
+                if (!isNaN(parsedDate.getTime())) {
+                    const year = parsedDate.getFullYear();
+                    const month = String(parsedDate.getMonth() + 1).padStart(2, '0');
+                    const day = String(parsedDate.getDate()).padStart(2, '0');
+                    normalizedDate = `${year}-${month}-${day}`;
+                }
+            } catch (e) {
+                console.error('Failed to parse date:', e);
+            }
+        }
         
-        setIsProcessing(false);
+        // If we have multiple items, create an expense for each item
+        if (result.items && Array.isArray(result.items) && result.items.length > 1) {
+            setIsSubmitting(true);
+            try {
+                const defaultCategory = categories.includes(result.category || 'Autre') 
+                    ? (result.category || 'Autre') 
+                    : (categories.includes('Autre') ? 'Autre' : categories[0] || 'Autre');
+                
+                // Build tax breakdown note
+                let taxNotes = '';
+                if (result.tax) {
+                    const taxParts: string[] = [];
+                    if (result.tax.gst) taxParts.push(`TPS: $${result.tax.gst.toFixed(2)}`);
+                    if (result.tax.qst) taxParts.push(`TVQ: $${result.tax.qst.toFixed(2)}`);
+                    if (result.tax.pst) taxParts.push(`PST: $${result.tax.pst.toFixed(2)}`);
+                    if (result.tax.hst) taxParts.push(`HST: $${result.tax.hst.toFixed(2)}`);
+                    if (result.tax.total) taxParts.push(`Total taxes: $${result.tax.total.toFixed(2)}`);
+                    if (taxParts.length > 0) {
+                        taxNotes = `\n\nTaxes: ${taxParts.join(', ')}`;
+                    }
+                }
+                
+                // Create an expense for each item
+                const expensePromises = result.items.map(async (item: { name: string; price: number }) => {
+                    const expenseId = `exp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                    const expenseNotes = `Article: ${item.name}${taxNotes}${result.total ? `\nTotal reçu: $${result.total.toFixed(2)}` : ''}${result.rawText ? `\n\nOCR: ${result.rawText.substring(0, 500)}` : ''}`;
+                    
+                    return onAddExpense({
+                        name: item.name,
+                        amount: item.price,
+                        date: normalizedDate,
+                        category: defaultCategory,
+                        jobId: jobId && jobId !== '' ? jobId : undefined,
+                        vendor: result.vendor,
+                        notes: expenseNotes.trim(),
+                        receiptImage: result.receiptPath ? undefined : undefined, // Receipt path stored separately
+                    });
+                });
+                
+                await Promise.all(expensePromises);
+                
+                // Show success and close modal
+                onClose();
+            } catch (error) {
+                console.error('Failed to create expenses from receipt items:', error);
+                // Fall back to form population on error
+                populateFormFromResult(result, normalizedDate);
+            } finally {
+                setIsSubmitting(false);
+            }
+        } else {
+            // Single item or no items - populate form as before
+            populateFormFromResult(result, normalizedDate);
+        }
+    };
+    
+    const populateFormFromResult = (result: any, normalizedDate: string) => {
+        // Populate form with extracted data
+        if (result.vendor) {
+            setName(result.vendor);
+            setVendor(result.vendor);
+        }
+        
+        // Use first item name if available, otherwise use vendor
+        if (result.items && result.items.length > 0) {
+            setName(result.items[0].name);
+            setAmount(result.items[0].price);
+        } else if (result.total) {
+            setAmount(result.total);
+        }
+        
+        if (normalizedDate) {
+            setDate(normalizedDate);
+        }
+        
+        if (result.category && categories.includes(result.category)) {
+            setCategory(result.category);
+        }
+        
+        // Build comprehensive notes with tax breakdown
+        let notesParts: string[] = [];
+        if (result.items && result.items.length > 0) {
+            notesParts.push(`Articles: ${result.items.map((i: any) => `${i.name} ($${i.price.toFixed(2)})`).join(', ')}`);
+        }
+        if (result.subtotal) {
+            notesParts.push(`Sous-total: $${result.subtotal.toFixed(2)}`);
+        }
+        if (result.tax) {
+            const taxParts: string[] = [];
+            if (result.tax.gst) taxParts.push(`TPS: $${result.tax.gst.toFixed(2)}`);
+            if (result.tax.qst) taxParts.push(`TVQ: $${result.tax.qst.toFixed(2)}`);
+            if (result.tax.pst) taxParts.push(`PST: $${result.tax.pst.toFixed(2)}`);
+            if (result.tax.hst) taxParts.push(`HST: $${result.tax.hst.toFixed(2)}`);
+            if (result.tax.total) taxParts.push(`Total taxes: $${result.tax.total.toFixed(2)}`);
+            if (taxParts.length > 0) {
+                notesParts.push(`Taxes: ${taxParts.join(', ')}`);
+            }
+        }
+        if (result.total) {
+            notesParts.push(`Total: $${result.total.toFixed(2)}`);
+        }
+        if (result.rawText) {
+            notesParts.push(`\nOCR brut:\n${result.rawText.substring(0, 500)}`);
+        }
+        
+        if (notesParts.length > 0) {
+            setNotes(notesParts.join('\n'));
+        }
     };
 
     const handleSubmit = async (e: React.FormEvent) => {
@@ -3113,25 +4741,40 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({ isOpen, onClos
                             className="w-full bg-white text-fiscalia-primary-dark placeholder:text-fiscalia-primary-dark/60 p-3 rounded-lg border border-fiscalia-primary-dark/20 focus:outline-none focus:ring-2 focus:ring-fiscalia-accent-gold/50"
                         />
                     </div>
-                    <div className="w-2/5 flex flex-col items-center">
+                    <div className="w-2/5 flex flex-col items-center gap-2">
                         <input type="file" accept="image/*" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
-                        <button type="button" onClick={() => fileInputRef.current?.click()} className="w-full h-32 bg-fiscalia-light-neutral border-2 border-dashed border-fiscalia-primary-dark/20 rounded-lg flex items-center justify-center text-fiscalia-primary-dark/60 hover:border-fiscalia-accent-gold hover:text-fiscalia-accent-gold transition-colors">
-                            {receiptImage ? <img src={receiptImage} alt="Aperçu du reçu" className="w-full h-full object-contain rounded-md" /> : <div className="text-center"><PaperclipIcon className="w-8 h-8 mx-auto"/><span className="text-sm">Ajouter un reçu</span></div>}
+                        {receiptImage ? (
+                            <div className="w-full relative">
+                                <img src={receiptImage} alt="Aperçu du reçu" className="w-full h-32 object-contain rounded-md border border-fiscalia-primary-dark/20 bg-fiscalia-light-neutral" />
+                                <button
+                                    type="button"
+                                    onClick={() => setReceiptImage(null)}
+                                    className="absolute top-1 right-1 p-1 bg-white rounded-full shadow-md text-fiscalia-error hover:bg-fiscalia-error/10 transition-colors"
+                                    title="Supprimer le reçu"
+                                >
+                                    <XMarkIcon className="w-4 h-4" />
                         </button>
-                        {receiptImage && (
-                            <Button type="button" onClick={handleAIProcess} disabled={isProcessing} className="w-full mt-2 py-2 px-3 text-sm flex items-center justify-center gap-2">
-                                {isProcessing ? (
-                                    <>
-                                     <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                                     Analyse en cours...
-                                     </>
-                                ) : (
-                                    <>
-                                    <SparklesIcon className="w-5 h-5" />
-                                    Analyser avec l'IA
-                                    </>
-                                )}
-                            </Button>
+                            </div>
+                        ) : (
+                            <div className="w-full space-y-2">
+                                <button 
+                            type="button" 
+                            onClick={() => setShowReceiptScanner(true)} 
+                                    className="w-full h-32 bg-fiscalia-light-neutral border-2 border-dashed border-fiscalia-primary-dark/20 rounded-lg flex flex-col items-center justify-center text-fiscalia-primary-dark/60 hover:border-fiscalia-accent-gold hover:text-fiscalia-accent-gold transition-colors gap-2"
+                                >
+                                    <SparklesIcon className="w-8 h-8" />
+                                    <span className="text-sm font-medium">Scanner un reçu</span>
+                                    <span className="text-xs text-fiscalia-primary-dark/50">(Analyse automatique)</span>
+                                </button>
+                                <button 
+                                    type="button" 
+                                    onClick={() => fileInputRef.current?.click()} 
+                                    className="w-full py-2 px-3 text-sm bg-white border border-fiscalia-primary-dark/20 rounded-lg text-fiscalia-primary-dark/70 hover:border-fiscalia-primary-dark/40 hover:text-fiscalia-primary-dark transition-colors flex items-center justify-center gap-2"
+                                >
+                                    <PaperclipIcon className="w-4 h-4" />
+                                    <span>Ou télécharger une image</span>
+                                </button>
+                            </div>
                         )}
                     </div>
                 </div>
@@ -3142,6 +4785,13 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({ isOpen, onClos
                     </Button>
                 </div>
             </form>
+            {showReceiptScanner && (
+                <ReceiptScanner
+                    onReceiptProcessed={handleReceiptProcessed}
+                    onClose={() => setShowReceiptScanner(false)}
+                    autoCreateExpense={false}
+                />
+            )}
         </Modal>
     );
 };
@@ -3539,6 +5189,7 @@ export const SidebarConversationHistory: React.FC<SidebarConversationHistoryProp
                                     ) : (
                                         <>
                                             <button
+                                                type="button"
                                                 onClick={() => onConversationSelect?.(conversation.id)}
                                                 className={`flex-1 w-full text-left px-3 py-2.5 rounded-md transition-colors overflow-hidden ${
                                                     isActive 
@@ -3588,6 +5239,7 @@ export const SidebarConversationHistory: React.FC<SidebarConversationHistoryProp
                                                 >
                                                     {onConversationRename && (
                                                         <button
+                                                            type="button"
                                                             onClick={(e) => handleRenameClick(conversation, e)}
                                                             className="w-full text-left px-3 py-2 text-sm text-white/70 hover:bg-white/10 hover:text-white transition-colors flex items-center gap-2"
                                                         >
@@ -3597,6 +5249,7 @@ export const SidebarConversationHistory: React.FC<SidebarConversationHistoryProp
                                                     )}
                                                     {onConversationDelete && (
                                                         <button
+                                                            type="button"
                                                             onClick={(e) => handleDelete(conversation.id, e)}
                                                             className="w-full text-left px-3 py-2 text-sm text-white/70 hover:bg-white/10 hover:text-white transition-colors flex items-center gap-2"
                                                         >
@@ -3791,6 +5444,7 @@ export const SidebarNotifications: React.FC<SidebarNotificationsProps> = ({
                                                 >
                                                     {onRenameNotification && (
                                                         <button
+                                                            type="button"
                                                             onClick={(e) => handleRenameClick(notification.id, notificationTitle, e)}
                                                             className="w-full text-left px-3 py-2 text-sm text-white/70 hover:bg-white/10 hover:text-white transition-colors flex items-center gap-2"
                                                         >
@@ -3800,6 +5454,7 @@ export const SidebarNotifications: React.FC<SidebarNotificationsProps> = ({
                                                     )}
                                                     {onDeleteNotification && (
                                                         <button
+                                                            type="button"
                                                             onClick={(e) => handleDelete(notification.id, e)}
                                                             className="w-full text-left px-3 py-2 text-sm text-white/70 hover:bg-white/10 hover:text-white transition-colors flex items-center gap-2"
                                                         >

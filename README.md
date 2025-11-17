@@ -11,6 +11,7 @@
 - 🤖 **AI-Powered Chat Interface**: Natural French conversation for managing finances
 - 📊 **Job/Contract Management**: Track projects with revenue, expenses, and profit calculations
 - 💰 **Expense Tracking**: Categorize and manage expenses with receipt attachments
+- 📷 **Receipt Scanning & OCR**: Automatically extract data from receipt photos using free OCR technology
 - 📈 **Financial Analytics**: Dashboard with revenue, expenses, and profit insights
 - 🔐 **Secure Data Storage**: All data persisted in Supabase with Row Level Security
 - 💬 **Conversation Memory**: AI remembers context across conversations
@@ -96,6 +97,7 @@ fiscalia/
 - **[Architecture](docs/ARCHITECTURE.md)** - System architecture and design decisions
 - **[Supabase Setup](docs/supabase-setup-guide.md)** - Database and Edge Functions setup
 - **[Environment Variables](docs/env-variables-guide.md)** - Configuration guide
+- **[Receipt OCR Guide](docs/RECEIPT-OCR-GUIDE.md)** - Receipt scanning and OCR setup
 - **[API Documentation](docs/api/ai.yaml)** - OpenAPI spec for Edge Functions
 - **[Testing Guide](docs/TESTING-GUIDE.md)** - Testing procedures and test cases
 - **[Deployment Guide](docs/DEPLOYMENT.md)** - Production deployment instructions
@@ -130,6 +132,7 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for detailed deployment instruction
    supabase functions deploy ai-actions
    supabase functions deploy financial-sync
    supabase functions deploy conversation-memory
+   supabase functions deploy receipt-ocr
    ```
 
 2. **Deploy Frontend**

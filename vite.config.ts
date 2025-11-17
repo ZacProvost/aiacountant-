@@ -7,7 +7,7 @@ export default defineConfig(({ mode }) => {
   return {
     server: {
       port: 5174,
-      host: '127.0.0.1',
+      host: '0.0.0.0', // Listen on all network interfaces to allow access from other devices
     },
     plugins: [react()],
     resolve: {

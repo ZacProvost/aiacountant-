@@ -8,6 +8,8 @@ create extension if not exists "pgcrypto";
 create or replace function public.set_updated_at()
 returns trigger
 language plpgsql
+security definer
+set search_path = pg_catalog, public
 as $$
 begin
   new.updated_at = now();
@@ -101,6 +103,8 @@ create table if not exists public.expenses (
   vendor text,
   notes text,
   receipt_path text,
+  -- Optional: stores structured OCR metadata for this expense's receipt
+  ocr_data jsonb,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -137,14 +141,24 @@ create table if not exists public.messages (
   timestamp timestamptz not null default now(),
   custom_title text,
   job_summary jsonb,
-  retain boolean not null default true
+  retain boolean not null default true,
+  -- Optional: storage path of a receipt image attached to this message
+  receipt_path text,
+  -- Optional: OCR summary data for the attached receipt
+  receipt_ocr jsonb
 );
 
 create index if not exists messages_user_id_idx on public.messages (user_id);
 create index if not exists messages_timestamp_idx on public.messages (timestamp desc);
 
 -- Views ----------------------------------------------------------------------
-create or replace view public.job_financial_summary as
+-- Note: Views are SECURITY INVOKER by default (use querying user's privileges)
+-- PostgreSQL views do not support SECURITY DEFINER - only functions do
+-- Views always execute with the privileges of the querying user
+drop view if exists public.job_financial_summary cascade;
+
+create view public.job_financial_summary
+as
   select
     j.id as job_id,
     j.user_id,
@@ -153,7 +167,14 @@ create or replace view public.job_financial_summary as
     j.revenue - coalesce(sum(e.amount), 0) as profit
   from public.jobs j
   left join public.expenses e on e.job_id = j.id
-  group by j.id;
+  group by j.id, j.user_id, j.revenue;
+
+-- Ensure proper ownership to avoid security linter issues
+alter view public.job_financial_summary owner to postgres;
+
+-- Grant permissions
+grant select on public.job_financial_summary to authenticated;
+grant select on public.job_financial_summary to anon;
 
 -- AI Metrics -----------------------------------------------------------------
 create table if not exists public.ai_metrics (
@@ -178,9 +199,15 @@ create table if not exists public.ai_alerts (
   window_minutes integer not null default 15
 );
 
+-- Enable RLS on ai_metrics and ai_alerts
+alter table public.ai_metrics enable row level security;
+alter table public.ai_alerts enable row level security;
+
 create or replace function public.raise_ai_alert()
 returns trigger
 language plpgsql
+security definer
+set search_path = pg_catalog, public
 as $$
 declare
   failures integer;

@@ -238,3 +238,6 @@ Fiscalia is a client-server application with an AI-powered conversational interf
 - [ ] Multi-language support beyond French
 - [ ] Advanced AI features (receipt OCR, tax suggestions)
 
+
+
+

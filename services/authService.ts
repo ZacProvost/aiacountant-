@@ -1,5 +1,5 @@
 import { supabase } from './supabaseClient';
-import type { Session, User } from '@supabase/supabase-js';
+import type { Session, User, AuthChangeEvent } from '@supabase/supabase-js';
 
 export interface Credentials {
   email: string;
@@ -20,11 +20,11 @@ export const authService = {
     return data.session ?? null;
   },
 
-  onAuthStateChange(callback: (session: Session | null) => void) {
+  onAuthStateChange(callback: (session: Session | null, event?: AuthChangeEvent) => void) {
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      callback(session);
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      callback(session, event);
     });
     return () => subscription.unsubscribe();
   },
@@ -70,6 +70,51 @@ export const authService = {
       return null;
     }
     return data.user ?? null;
+  },
+
+  async requestPasswordReset(email: string) {
+    const { error } = await supabase.auth.resetPasswordForEmail(email.trim().toLowerCase(), {
+      redirectTo: `${window.location.origin}`,
+    });
+    if (error) {
+      throw error;
+    }
+  },
+
+  async updatePassword(newPassword: string) {
+    const { error } = await supabase.auth.updateUser({
+      password: newPassword,
+    });
+    if (error) {
+      throw error;
+    }
+  },
+
+  async changePassword(currentPassword: string, newPassword: string) {
+    // First verify current password by attempting to sign in
+    const user = await this.getUser();
+    if (!user?.email) {
+      throw new Error('Utilisateur non trouvé');
+    }
+
+    // Verify current password
+    const { error: signInError } = await supabase.auth.signInWithPassword({
+      email: user.email,
+      password: currentPassword,
+    });
+
+    if (signInError) {
+      throw new Error('Mot de passe actuel incorrect');
+    }
+
+    // Update to new password
+    const { error: updateError } = await supabase.auth.updateUser({
+      password: newPassword,
+    });
+
+    if (updateError) {
+      throw updateError;
+    }
   },
 };
 

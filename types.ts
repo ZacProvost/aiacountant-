@@ -51,6 +51,23 @@ export interface ChatMessage {
   timestamp: string;
   jobSummary?: Job;
   customTitle?: string;
+  receiptImage?: string; // Public URL or data URL used by the UI
+  receiptPath?: string; // Storage path in Supabase
+  receiptOcrData?: {
+    vendor?: string;
+    total?: number;
+    date?: string;
+    rawText?: string;
+    items?: Array<{ name: string; price: number }>;
+    subtotal?: number;
+    tax?: {
+      gst?: number;
+      pst?: number;
+      qst?: number;
+      hst?: number;
+      total?: number;
+    };
+  }; // OCR data extracted from receipt
 }
 
 export type Screen = 'onboarding' | 'assistant' | 'jobs' | 'jobDetail' | 'expenses' | 'dashboard' | 'reports' | 'settings';

@@ -223,11 +223,24 @@ const executeAction = async (
         throw new HttpError('Le nom de la dépense est requis.', 400);
       }
       let jobId: string | null = null;
-      if (data.jobId || data.jobName) {
-        jobId = await resolveJobId(supabase, userId, {
-          jobId: data.jobId,
-          jobName: data.jobName,
-        });
+      // Only try to resolve jobId if we have meaningful values
+      const normalizedJobId = normalizeNullableString(data.jobId);
+      const normalizedJobName = normalizeNullableString(data.jobName);
+      if (normalizedJobId || normalizedJobName) {
+        try {
+          jobId = await resolveJobId(supabase, userId, {
+            jobId: normalizedJobId,
+            jobName: normalizedJobName,
+          });
+        } catch (error) {
+          // If job is not found, allow expense to be created without a contract
+          // This allows expenses to exist independently of contracts
+          if (error instanceof HttpError && error.status === 404) {
+            jobId = null;
+          } else {
+            throw error;
+          }
+        }
       }
 
       const { expense, updatedJob } = await financialRepository.createExpense(supabase, userId, {

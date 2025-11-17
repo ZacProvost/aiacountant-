@@ -20,6 +20,7 @@ import {
   ChatScreen,
   SettingsScreen,
   ReportsScreen,
+  ResetPasswordScreen,
   Toast,
   AddJobModal,
   AddExpenseModal,
@@ -146,8 +147,27 @@ const mergeMessagesByConversation = (
       }
       const existingTime = new Date(existing.timestamp).getTime();
       const candidateTime = new Date(message.timestamp).getTime();
-      if (Number.isNaN(existingTime) || Number.isNaN(candidateTime) || candidateTime >= existingTime) {
+      // Prefer message with receiptPath if timestamps are equal (database version has receiptPath)
+      if (Number.isNaN(existingTime) || Number.isNaN(candidateTime) || candidateTime > existingTime) {
         mergedMessages.set(message.id, message);
+      } else if (candidateTime === existingTime) {
+        // If timestamps are equal, prefer the one with receiptPath (from database)
+        if (message.receiptPath && !existing.receiptPath) {
+          mergedMessages.set(message.id, message);
+        } else if (!message.receiptPath && existing.receiptPath) {
+          // Keep existing if it has receiptPath and new one doesn't
+          mergedMessages.set(message.id, existing);
+        } else {
+          // Merge receiptPath and receiptOcrData if one has it and the other doesn't
+          const merged = { ...existing };
+          if (message.receiptPath && !existing.receiptPath) {
+            merged.receiptPath = message.receiptPath;
+          }
+          if (message.receiptOcrData && !existing.receiptOcrData) {
+            merged.receiptOcrData = message.receiptOcrData;
+          }
+          mergedMessages.set(message.id, merged);
+        }
       }
     };
 
@@ -205,6 +225,7 @@ const App: React.FC = () => {
   const [authError, setAuthError] = useState<string | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [isDataLoading, setIsDataLoading] = useState(false);
+  const [isPasswordResetMode, setIsPasswordResetMode] = useState(false);
 
   const [isOnboarding, setIsOnboarding] = useState(false);
   const [screen, setScreen] = useState<Screen>('dashboard');
@@ -434,26 +455,6 @@ const App: React.FC = () => {
 
         let workingConversations = orderedConversations;
 
-        // Ensure the primary conversation shows the welcome message if empty
-        const primaryConversationId = orderedConversations[0]?.id;
-        if (primaryConversationId && nextMessagesByConversation[primaryConversationId].length === 0) {
-          const welcomeMessage = createWelcomeMessage(primaryConversationId);
-          nextMessagesByConversation[primaryConversationId] = [welcomeMessage];
-          const persistWelcomePromise = dataService.upsertMessages([welcomeMessage], activeSession.user.id);
-          registerPendingChatOperation(persistWelcomePromise);
-          await persistWelcomePromise;
-          workingConversations = orderedConversations.map((conversation) =>
-            conversation.id === primaryConversationId
-              ? {
-                  ...conversation,
-                  hasUserMessage: false,
-                  lastMessagePreview: undefined,
-                  lastMessageAt: welcomeMessage.timestamp,
-                }
-              : conversation
-          );
-        }
-
         const localMessagesByConversation = readLocalConversationMessages(activeSession.user.id);
 
         const mergedLocalAndInMemory = mergeMessagesByConversation(localMessagesByConversation, conversationMessagesRef.current);
@@ -484,7 +485,9 @@ const App: React.FC = () => {
               !stored ||
               stored.text !== message.text ||
               stored.timestamp !== message.timestamp ||
-              stored.sender !== message.sender;
+              stored.sender !== message.sender ||
+              stored.receiptPath !== message.receiptPath ||
+              JSON.stringify(stored.receiptOcrData) !== JSON.stringify(message.receiptOcrData);
 
             if (requiresSync && !dedupeSyncIds.has(message.id)) {
               messagesNeedingSync.push(message);
@@ -524,7 +527,7 @@ const App: React.FC = () => {
         });
 
         const finalConversations = sortConversationsDesc(enrichedConversations);
-        const fallbackConversationId = finalConversations[0]?.id ?? primaryConversationId ?? null;
+        const fallbackConversationId = finalConversations[0]?.id ?? null;
 
         setConversations(finalConversations);
         setTrackedConversationMessages((current) => {
@@ -556,11 +559,33 @@ const App: React.FC = () => {
   );
 
   useEffect(() => {
+    // Check for password reset token in URL hash
+    const hashParams = new URLSearchParams(window.location.hash.substring(1));
+    const accessToken = hashParams.get('access_token');
+    const type = hashParams.get('type');
+    
+    // Check if we're on a password reset flow
+    // Note: Don't clear the hash yet - Supabase needs it to establish the session
+    if (type === 'recovery' && accessToken) {
+      setIsPasswordResetMode(true);
+      // Wait a bit for Supabase to process the token and establish the session
+      // The session will be established via onAuthStateChange
+    }
+  }, []);
+
+  useEffect(() => {
     let mounted = true;
 
     authService.getSession().then(async (currentSession) => {
       if (!mounted) return;
       setSession(currentSession);
+      
+      // If we're in password reset mode, don't load user data
+      if (isPasswordResetMode) {
+        setIsAuthLoading(false);
+        return;
+      }
+      
       if (currentSession) {
         await loadUserData(currentSession);
         const cachedMessages = readLocalConversationMessages(currentSession.user.id);
@@ -574,9 +599,35 @@ const App: React.FC = () => {
       setIsAuthLoading(false);
     });
 
-    const unsubscribe = authService.onAuthStateChange(async (nextSession) => {
+    const unsubscribe = authService.onAuthStateChange(async (nextSession, event) => {
       if (!mounted) return;
+      
+      // Check URL hash for password reset token
+      const hashParams = new URLSearchParams(window.location.hash.substring(1));
+      const accessToken = hashParams.get('access_token');
+      const type = hashParams.get('type');
+      
+      // If this is a password recovery event, set password reset mode
+      if (event === 'PASSWORD_RECOVERY' || (type === 'recovery' && accessToken && nextSession)) {
+        setIsPasswordResetMode(true);
+        // Now we can safely clear the hash after session is established
+        if (type === 'recovery' && accessToken) {
+          setTimeout(() => {
+            window.history.replaceState(null, '', window.location.pathname + window.location.search);
+          }, 100);
+        }
+        setSession(nextSession);
+        setIsAuthLoading(false);
+        return;
+      }
+      
       setSession(nextSession);
+      
+      if (isPasswordResetMode) {
+        setIsAuthLoading(false);
+        return;
+      }
+      
       if (nextSession) {
         await loadUserData(nextSession);
       } else {
@@ -590,7 +641,7 @@ const App: React.FC = () => {
       mounted = false;
       unsubscribe();
     };
-  }, [awaitPendingChatOperations, loadUserData, resetAppState]);
+  }, [awaitPendingChatOperations, loadUserData, resetAppState, isPasswordResetMode]);
 
   const handleSignIn = useCallback(
     async ({ email, password }: { email: string; password: string }) => {
@@ -610,6 +661,18 @@ const App: React.FC = () => {
       }
     },
     [loadUserData]
+  );
+
+  const handleForgotPassword = useCallback(
+    async (email: string) => {
+      try {
+        await authService.requestPasswordReset(email);
+      } catch (error) {
+        console.error('forgotPassword error', error);
+        throw error;
+      }
+    },
+    []
   );
 
   const handleSignUp = useCallback(
@@ -873,18 +936,16 @@ const App: React.FC = () => {
 
     try {
       const conversation = await dataService.createConversation(session!.user.id);
-      const welcomeMessage = createWelcomeMessage(conversation.id);
 
       setTrackedConversationMessages((prev) => ({
         ...prev,
-        [conversation.id]: [welcomeMessage],
+        [conversation.id]: [],
       }));
 
       setConversations((prev) =>
         sortConversationsDesc([
           {
             ...conversation,
-            lastMessageAt: welcomeMessage.timestamp,
             hasUserMessage: false,
             lastMessagePreview: undefined,
           },
@@ -897,7 +958,6 @@ const App: React.FC = () => {
         setScreen('assistant');
       }
 
-      await dataService.upsertMessages([welcomeMessage], session!.user.id);
       return conversation.id;
     } catch (error) {
       console.error('Failed to create conversation', error);
@@ -1180,6 +1240,31 @@ const App: React.FC = () => {
     }
   }, [ensureSession, session]);
 
+  // Silent refresh that doesn't show loading indicator
+  const refreshDataSilent = useCallback(async () => {
+    if (!ensureSession()) {
+      return;
+    }
+    try {
+      const data = await dataService.loadData(session!.user.id);
+      setJobs(data.jobs);
+      setExpenses(data.expenses);
+      const nextCategories = data.categories.length ? data.categories : DEFAULT_CATEGORIES;
+      setCategories(nextCategories);
+      setNotifications(data.notifications);
+      setSelectedJob((prev) => {
+        if (!prev) {
+          return prev;
+        }
+        const updated = data.jobs.find((job) => job.id === prev.id);
+        return updated ?? prev;
+      });
+    } catch (error) {
+      console.error('Failed to refresh data silently', error);
+      // Don't throw - fail silently
+    }
+  }, [ensureSession, session]);
+
   const addJob = useCallback(
     async (job: Job) => {
       if (!ensureSession()) return;
@@ -1314,6 +1399,32 @@ const App: React.FC = () => {
     [ensureSession, showToast]
   );
 
+  const handleDeleteReceiptFromExpense = useCallback(
+    async (expense: Expense) => {
+      if (!ensureSession()) return;
+      
+      try {
+        // Delete receipt from storage if it's a URL
+        if (expense.receiptImage && (expense.receiptImage.startsWith('http') || expense.receiptImage.startsWith('/'))) {
+          const { receiptService } = await import('./services/receiptService');
+          await receiptService.deleteReceipt(expense.receiptImage);
+        }
+        
+        // Update expense to remove receipt image
+        const updatedExpense = {
+          ...expense,
+          receiptImage: undefined,
+        };
+        await updateExpense(updatedExpense);
+        showToast('Reçu supprimé avec succès!');
+      } catch (error) {
+        console.error('Failed to delete receipt from expense:', error);
+        showToast("Impossible de supprimer le reçu.");
+      }
+    },
+    [ensureSession, updateExpense, showToast]
+  );
+
   const handleDeleteExpense = useCallback(
     async (expenseId: string, _expenseName: string) => {
       if (!ensureSession()) return;
@@ -1335,6 +1446,17 @@ const App: React.FC = () => {
         name: expenseToDelete.name,
         jobId: expenseToDelete.jobId,
       });
+      
+      // Delete receipt from storage if it exists
+      if (expenseToDelete.receiptImage && (expenseToDelete.receiptImage.startsWith('http') || expenseToDelete.receiptImage.startsWith('/'))) {
+        try {
+          const { receiptService } = await import('./services/receiptService');
+          await receiptService.deleteReceipt(expenseToDelete.receiptImage);
+        } catch (error) {
+          console.error('Failed to delete receipt when deleting expense:', error);
+          // Continue with expense deletion even if receipt deletion fails
+        }
+      }
       
       // Optimistic update: remove expense from UI immediately
       const previousExpenses = expenses;
@@ -1617,6 +1739,29 @@ const App: React.FC = () => {
     showToast('Paramètres enregistrés!');
   }, [showToast]);
 
+  const handlePasswordResetComplete = useCallback(async () => {
+    setIsPasswordResetMode(false);
+    setAuthMode('signin');
+    showToast('Mot de passe réinitialisé avec succès. Veuillez vous connecter.');
+  }, [showToast]);
+
+  const handlePasswordResetCancel = useCallback(() => {
+    setIsPasswordResetMode(false);
+    setAuthMode('signin');
+  }, []);
+
+  if (isPasswordResetMode) {
+    return (
+      <>
+        <ResetPasswordScreen 
+          onPasswordReset={handlePasswordResetComplete}
+          onCancel={handlePasswordResetCancel}
+        />
+        <Toast message={toastMessage} isVisible={isToastVisible} />
+      </>
+    );
+  }
+
   if (isAuthLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-fiscalia-primary-dark text-white">
@@ -1633,6 +1778,7 @@ const App: React.FC = () => {
           onModeChange={setAuthMode}
           onSignIn={handleSignIn}
           onSignUp={handleSignUp}
+          onForgotPassword={handleForgotPassword}
           isLoading={isAuthLoading}
           error={authError}
         />
@@ -1689,6 +1835,7 @@ const App: React.FC = () => {
             onManageCategories={() => setManageCategoriesModalOpen(true)}
             onEditExpense={openEditExpenseModal}
             onDeleteExpense={handleDeleteExpense}
+            onDeleteReceipt={handleDeleteReceiptFromExpense}
           />
         );
       case 'assistant':
@@ -1715,7 +1862,7 @@ const App: React.FC = () => {
             markNotificationRead={markNotificationFromAI}
             deleteNotification={deleteNotificationFromAI}
             registerPendingOperation={registerPendingChatOperation}
-            onRequireRefresh={refreshData}
+            onRequireRefresh={refreshDataSilent}
           />
         );
       case 'reports':
@@ -1760,16 +1907,12 @@ const App: React.FC = () => {
         onDeleteCategory={deleteCategory}
         />
         <Toast message={toastMessage} isVisible={isToastVisible} />
-        {isDataLoading && (
-          <div className="absolute top-4 right-4 z-40 bg-white px-4 py-2 rounded-md shadow-lg text-sm text-fiscalia-primary-dark">
-            Synchronisation Supabase...
-          </div>
-        )}
         <div className="flex-1 overflow-y-auto pb-20">{renderScreen()}</div>
         <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-fiscalia-primary-dark/10 flex justify-around">
           {NAVIGATION_ITEMS.map((item) => (
             <button
               key={item.screen}
+              type="button"
               onClick={() => setScreen(item.screen)}
               className={`flex flex-col items-center justify-center p-3 w-full transition-colors ${
                 screen === item.screen ? 'text-fiscalia-accent-gold' : 'text-fiscalia-primary-dark/60'
@@ -1817,6 +1960,7 @@ const App: React.FC = () => {
 
         <div className="p-2 flex-shrink-0 border-b border-white/10">
           <button
+            type="button"
             onClick={() => {
               void handleStartConversation();
             }}
@@ -1832,6 +1976,7 @@ const App: React.FC = () => {
             {DESKTOP_NAVIGATION_ITEMS.filter((item) => item.screen !== 'assistant').map((item) => (
               <button
                 key={item.screen}
+                type="button"
                 onClick={() => setScreen(item.screen)}
                 className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-md text-left transition-colors ${
                   screen === item.screen ? 'bg-white/10 text-white' : 'text-white/70 hover:bg-white/5 hover:text-white'
@@ -1910,11 +2055,6 @@ const App: React.FC = () => {
       </aside>
 
       <div className="flex-1 flex min-w-0 relative">
-        {isDataLoading && (
-          <div className="absolute top-4 right-4 z-40 bg-white px-4 py-2 rounded-md shadow-lg text-sm text-fiscalia-primary-dark">
-            Synchronisation Supabase...
-          </div>
-        )}
         {screen !== 'assistant' && <MainContent />}
         {screen !== 'settings' && (
           <div className={`transition-all duration-500 ease-in-out flex-shrink-0 ${screen === 'assistant' ? 'w-full' : 'w-96'}`}>
@@ -1942,7 +2082,7 @@ const App: React.FC = () => {
                 deleteNotification={deleteNotificationFromAI}
                 registerPendingOperation={registerPendingChatOperation}
                 focusAssistantOnNewConversation={false}
-                onRequireRefresh={refreshData}
+                onRequireRefresh={refreshDataSilent}
               />
             </div>
           </div>

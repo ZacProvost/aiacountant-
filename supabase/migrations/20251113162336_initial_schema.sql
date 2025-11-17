@@ -3,7 +3,6 @@
 
 create extension if not exists "uuid-ossp";
 create extension if not exists "pgcrypto";
-
 -- Utility --------------------------------------------------------------------
 create or replace function public.set_updated_at()
 returns trigger
@@ -14,7 +13,6 @@ begin
   return new;
 end;
 $$;
-
 -- Profiles -------------------------------------------------------------------
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
@@ -25,13 +23,11 @@ create table if not exists public.profiles (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
-
 drop trigger if exists handle_profiles_updated_at on public.profiles;
 create trigger handle_profiles_updated_at
 before update on public.profiles
 for each row
 execute procedure public.set_updated_at();
-
 -- Conversations --------------------------------------------------------------
 create table if not exists public.conversations (
   id text primary key,
@@ -44,16 +40,13 @@ create table if not exists public.conversations (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
-
 create index if not exists conversations_user_id_idx on public.conversations (user_id);
 create index if not exists conversations_last_message_at_idx on public.conversations (last_message_at desc);
-
 drop trigger if exists handle_conversations_updated_at on public.conversations;
 create trigger handle_conversations_updated_at
 before update on public.conversations
 for each row
 execute procedure public.set_updated_at();
-
 -- Jobs -----------------------------------------------------------------------
 create table if not exists public.jobs (
   id text primary key,
@@ -71,16 +64,13 @@ create table if not exists public.jobs (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
-
 create index if not exists jobs_user_id_idx on public.jobs (user_id);
 create index if not exists jobs_status_idx on public.jobs (status);
-
 drop trigger if exists handle_jobs_updated_at on public.jobs;
 create trigger handle_jobs_updated_at
 before update on public.jobs
 for each row
 execute procedure public.set_updated_at();
-
 -- Categories -----------------------------------------------------------------
 create table if not exists public.categories (
   id uuid primary key default gen_random_uuid(),
@@ -88,10 +78,8 @@ create table if not exists public.categories (
   name text not null,
   created_at timestamptz not null default now()
 );
-
 create unique index if not exists categories_user_id_name_key
 on public.categories (user_id, name);
-
 -- Expenses -------------------------------------------------------------------
 create table if not exists public.expenses (
   id text primary key,
@@ -107,16 +95,13 @@ create table if not exists public.expenses (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
-
 create index if not exists expenses_user_id_idx on public.expenses (user_id);
 create index if not exists expenses_job_id_idx on public.expenses (job_id);
-
 drop trigger if exists handle_expenses_updated_at on public.expenses;
 create trigger handle_expenses_updated_at
 before update on public.expenses
 for each row
 execute procedure public.set_updated_at();
-
 -- Notifications --------------------------------------------------------------
 create table if not exists public.notifications (
   id text primary key,
@@ -127,10 +112,8 @@ create table if not exists public.notifications (
   read boolean not null default false,
   job_id text references public.jobs(id) on delete set null
 );
-
 create index if not exists notifications_user_id_idx on public.notifications (user_id);
 create index if not exists notifications_read_idx on public.notifications (read);
-
 -- Messages -------------------------------------------------------------------
 create table if not exists public.messages (
   id text primary key,
@@ -143,10 +126,8 @@ create table if not exists public.messages (
   job_summary jsonb,
   retain boolean not null default true
 );
-
 create index if not exists messages_user_id_idx on public.messages (user_id);
 create index if not exists messages_timestamp_idx on public.messages (timestamp desc);
-
 -- Views ----------------------------------------------------------------------
 create or replace view public.job_financial_summary as
   select
@@ -158,7 +139,6 @@ create or replace view public.job_financial_summary as
   from public.jobs j
   left join public.expenses e on e.job_id = j.id
   group by j.id;
-
 -- AI Metrics -----------------------------------------------------------------
 create table if not exists public.ai_metrics (
   id uuid primary key default gen_random_uuid(),
@@ -172,7 +152,6 @@ create table if not exists public.ai_metrics (
   error_message text,
   created_at timestamptz not null default now()
 );
-
 create table if not exists public.ai_alerts (
   id uuid primary key default gen_random_uuid(),
   triggered_at timestamptz not null default now(),
@@ -181,7 +160,6 @@ create table if not exists public.ai_alerts (
   error_rate numeric,
   window_minutes integer not null default 15
 );
-
 create or replace function public.raise_ai_alert()
 returns trigger
 language plpgsql
@@ -230,9 +208,7 @@ begin
   return new;
 end;
 $$;
-
 drop trigger if exists ai_metrics_alert_trigger on public.ai_metrics;
 create trigger ai_metrics_alert_trigger
 after insert on public.ai_metrics
 for each row execute procedure public.raise_ai_alert();
-

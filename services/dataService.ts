@@ -32,7 +32,9 @@ export const mapExpenseFromDb = (record: any): Expense => ({
   category: record.category,
   date: record.date,
   jobId: record.job_id ?? undefined,
-  receiptImage: undefined,
+  // Store receipt_path as-is - the ExpenseDetailModal will generate a signed URL for private buckets
+  // Format: receipt_path is like "userId/filename.jpg" which can be used directly with createSignedUrl
+  receiptImage: record.receipt_path ?? undefined,
   vendor: record.vendor ?? undefined,
   notes: record.notes ?? undefined,
 });
@@ -46,15 +48,27 @@ export const mapNotificationFromDb = (record: any): Notification => ({
   jobId: record.job_id ?? undefined,
 });
 
-export const mapMessageFromDb = (record: any): ChatMessage => ({
-  id: record.id,
-  conversationId: record.conversation_id,
-  sender: record.sender,
-  text: record.text,
-  timestamp: record.timestamp,
-  customTitle: record.custom_title ?? undefined,
-  jobSummary: record.job_summary ?? undefined,
-});
+export const mapMessageFromDb = (record: any): ChatMessage => {
+  // Note: receiptImage is not set here because the receipts bucket is private
+  // UserMessageBubble will generate signed URLs from receiptPath when needed
+  // This ensures proper authentication and security for private buckets
+  // The component handles this efficiently with proper loading states
+  
+  return {
+    id: record.id,
+    conversationId: record.conversation_id,
+    sender: record.sender,
+    text: record.text,
+    timestamp: record.timestamp,
+    customTitle: record.custom_title ?? undefined,
+    jobSummary: record.job_summary ?? undefined,
+    receiptPath: record.receipt_path ?? undefined,
+    // receiptImage is undefined - UserMessageBubble will generate signed URL
+    // This is correct for private buckets with RLS
+    receiptImage: undefined,
+    receiptOcrData: record.receipt_ocr ?? undefined,
+  };
+};
 
 export const mapConversationFromDb = (record: any): Conversation => ({
   id: record.id,
@@ -446,6 +460,8 @@ export const dataService = {
       custom_title: message.customTitle ?? null,
       job_summary: message.jobSummary ?? null,
       retain: true,
+      receipt_path: message.receiptPath ?? null,
+      receipt_ocr: message.receiptOcrData ?? null,
     }));
     const { error } = await supabase.from('messages').upsert(payload);
     if (error) {
